@@ -1,0 +1,437 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SF Options Desk</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7; --surface: #fcfcfb; --raised: #ffffff;
+  --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --axis: #c3c2b7; --border: #e1e0d9;
+  --series-1: #2a78d6; --series-2: #eb6834;
+  --good: #0ca30c; --good-text: #006300; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b;
+  --bad-text: #b42323;
+  --btn: #f0efec; --btn-hover: #e6e5e0;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --raised: #222221;
+    --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --axis: #383835; --border: #2c2c2a;
+    --series-1: #3987e5; --series-2: #d95926;
+    --good-text: #0ca30c; --bad-text: #e66767;
+    --btn: #2a2a28; --btn-hover: #343432;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19; --raised: #222221;
+  --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --axis: #383835; --border: #2c2c2a;
+  --series-1: #3987e5; --series-2: #d95926;
+  --good-text: #0ca30c; --bad-text: #e66767;
+  --btn: #2a2a28; --btn-hover: #343432;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--page); color: var(--ink);
+  font: 13px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+.num, td.n, th.n { font-variant-numeric: tabular-nums; text-align: right; }
+header { position: sticky; top: 0; z-index: 5; display: flex; flex-wrap: wrap; gap: 8px 16px;
+  align-items: center; padding: 10px 16px; background: var(--surface); border-bottom: 1px solid var(--border); }
+header h1 { font-size: 15px; margin: 0 8px 0 0; }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 2px 8px; border-radius: 999px;
+  border: 1px solid var(--border); color: var(--ink-2); white-space: nowrap; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.dot.good { background: var(--good); } .dot.warning { background: var(--warning); }
+.dot.serious { background: var(--serious); } .dot.critical { background: var(--critical); }
+.spacer { flex: 1; }
+button { font: inherit; color: var(--ink); background: var(--btn); border: 1px solid var(--border);
+  border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+button:hover { background: var(--btn-hover); }
+button.danger { color: #fff; background: var(--critical); border-color: var(--critical); }
+button.on { outline: 2px solid var(--warning); }
+button:disabled { opacity: .5; cursor: not-allowed; }
+main { padding: 16px; display: grid; gap: 16px; grid-template-columns: repeat(12, minmax(0, 1fr)); }
+section { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px;
+  min-width: 0; grid-column: span 12; }
+@media (min-width: 1100px) {
+  .w4 { grid-column: span 4; } .w6 { grid-column: span 6; } .w8 { grid-column: span 8; }
+}
+section h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--ink-2);
+  margin: 0 0 10px; display: flex; gap: 8px; align-items: center; }
+section h2 .hint { text-transform: none; letter-spacing: 0; color: var(--muted); font-weight: 400; }
+.tiles { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+.tile .label { color: var(--ink-2); font-size: 12px; }
+.tile .value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.tile .sub { color: var(--muted); font-size: 12px; }
+.pos { color: var(--good-text); } .neg { color: var(--bad-text); }
+.scroll { overflow: auto; max-height: 340px; }
+table { width: 100%; border-collapse: collapse; }
+th, td { padding: 4px 8px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+th { color: var(--ink-2); font-weight: 500; text-align: left; position: sticky; top: 0; background: var(--surface); }
+td.muted, .muted { color: var(--muted); }
+.empty { color: var(--muted); padding: 8px 0; }
+.meter { position: relative; height: 8px; background: var(--grid); border-radius: 4px; min-width: 120px; }
+.meter .fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 4px; background: var(--series-1); }
+.meter .fill.warning { background: var(--warning); } .meter .fill.serious { background: var(--serious); }
+.meter .fill.critical { background: var(--critical); }
+.meter .tick { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--ink-2); }
+.feed { list-style: none; margin: 0; padding: 0; }
+.feed li { display: flex; gap: 8px; padding: 3px 0; border-bottom: 1px solid var(--grid); align-items: baseline; }
+.feed time { color: var(--muted); font-variant-numeric: tabular-nums; flex: none; }
+.chart { position: relative; }
+.chart svg { display: block; width: 100%; height: 220px; }
+.tip { position: absolute; pointer-events: none; background: var(--raised); border: 1px solid var(--border);
+  border-radius: 6px; padding: 4px 8px; font-size: 12px; box-shadow: 0 2px 8px rgba(0,0,0,.12); display: none; }
+.legend { display: flex; gap: 14px; color: var(--ink-2); font-size: 12px; margin-bottom: 6px; flex-wrap: wrap; }
+.legend span::before { content: ""; display: inline-block; width: 14px; height: 0; border-top: 2px solid currentColor;
+  vertical-align: middle; margin-right: 6px; }
+.legend .s1 { color: var(--series-1); } .legend .ref::before { border-top-style: dashed; }
+.legend .ref.w { color: var(--warning); } .legend .ref.h { color: var(--critical); }
+.legend span { color: var(--ink-2); }
+form.struct { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: end; margin-bottom: 10px; }
+form.struct label { display: grid; gap: 2px; color: var(--ink-2); font-size: 12px; }
+select, input { font: inherit; color: var(--ink); background: var(--raised); border: 1px solid var(--border);
+  border-radius: 6px; padding: 3px 6px; }
+input[type=number] { width: 80px; }
+.controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.note { color: var(--muted); font-size: 12px; margin-top: 6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>San Francisco · Options Taking</h1>
+  <span class="pill" id="conn"><span class="dot"></span><span>connecting…</span></span>
+  <span class="pill" id="sess"><span class="dot"></span><span>session</span></span>
+  <span class="pill" id="bot"><span class="dot"></span><span>bot</span></span>
+  <span class="pill" id="loss"><span class="dot"></span><span>loss level</span></span>
+  <span class="spacer"></span>
+  <span class="controls" id="pauses"></span>
+  <button class="danger" id="cancelAll" title="Mass cancel: every resting order of the team, every strategy">Cancel all orders</button>
+</header>
+
+<main>
+  <section class="w8">
+    <h2>Account</h2>
+    <div class="tiles" id="tiles"></div>
+  </section>
+  <section class="w4">
+    <h2>Alerts <span class="hint">risk notices, disconnections, limits, bot warnings</span></h2>
+    <div class="scroll" style="max-height:150px"><ul class="feed" id="alerts"></ul></div>
+  </section>
+
+  <section class="w8">
+    <h2>Daily P&amp;L <span class="hint">sampled every 30 s from the exchange's account state</span></h2>
+    <div class="legend"><span class="s1">Daily P&amp;L</span><span class="ref w">Loss warning</span><span class="ref h">Loss halt</span></div>
+    <div class="chart" id="pnlChart"><svg role="img" aria-label="Daily P&L over time"></svg><div class="tip"></div></div>
+  </section>
+  <section class="w4">
+    <h2>P&amp;L split <span class="hint" id="pnlSince"></span></h2>
+    <table id="pnlStrat"></table>
+    <div style="height:10px"></div>
+    <table id="pnlUnd"></table>
+  </section>
+
+  <section class="w6">
+    <h2>Greeks by underlying <span class="hint">dollar delta, $ gamma per 1% move, $ vega per vol point, $ theta per day</span></h2>
+    <div class="scroll"><table id="greeks"></table></div>
+  </section>
+  <section class="w6">
+    <h2>Limits <span class="hint">used vs our cap (tick) and the exchange cap (end of bar)</span></h2>
+    <div class="scroll"><table id="limits"></table></div>
+  </section>
+
+  <section class="w8">
+    <h2>Positions</h2>
+    <div class="scroll"><table id="positions"></table></div>
+  </section>
+  <section class="w4">
+    <h2>Resting orders</h2>
+    <div class="scroll"><table id="resting"></table></div>
+  </section>
+
+  <section class="w6">
+    <h2>Fills</h2>
+    <div class="scroll"><table id="fills"></table></div>
+  </section>
+  <section class="w6">
+    <h2>Rejects &amp; bot events</h2>
+    <div class="scroll"><ul class="feed" id="rejects"></ul></div>
+  </section>
+
+  <section>
+    <h2>Structures <span class="hint">priced at the wall (taker) against Black-76 on the published forward</span></h2>
+    <form class="struct" id="structForm" onsubmit="return false">
+      <label>Underlying <select name="underlying"></select></label>
+      <label>Expiry <select name="expiry"></select></label>
+      <label>Structure <select name="structure">
+        <option value="straddle">Straddle</option><option value="strangle">Strangle</option>
+        <option value="risk_reversal">Risk reversal (−put +call)</option>
+        <option value="call_spread">Call spread</option><option value="put_spread">Put spread</option>
+        <option value="call_butterfly">Call butterfly</option><option value="put_butterfly">Put butterfly</option>
+        <option value="call">Call</option><option value="put">Put</option>
+      </select></label>
+      <label>Direction <select name="direction"><option value="1">Buy</option><option value="-1">Sell</option></select></label>
+      <label>Qty <input type="number" name="qty" min="1" max="25" value="1"></label>
+      <span id="strikes" style="display:contents"></span>
+      <label>Vol override % <input type="number" name="vol" step="0.1" placeholder="published"></label>
+      <button id="priceBtn">Price</button>
+      <button id="sendBtn" class="danger" disabled>Send legs…</button>
+    </form>
+    <div id="structOut"></div>
+    <div class="note" id="structNote"></div>
+    <div id="jobs"></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const fmt = (v, dp = 0) => v == null || Number.isNaN(v) ? "—" :
+  v.toLocaleString("en-US", {minimumFractionDigits: dp, maximumFractionDigits: dp});
+const usd = (v, dp = 0) => v == null ? "—" : (v < 0 ? "−$" : "$") + fmt(Math.abs(v), dp);
+const signed = (v, dp = 0) => v == null ? "—" : `<span class="${v > 0 ? "pos" : v < 0 ? "neg" : ""}">${usd(v, dp)}</span>`;
+const hhmm = (t) => t ? new Date(t * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"}) : "";
+const post = (url, body) => fetch(url, {method: "POST", headers: {"Content-Type": "application/json", "X-SF-Dashboard": "1"},
+  body: JSON.stringify(body || {})}).then((r) => r.json());
+
+function pill(id, level, text) {
+  const el = $(id);
+  el.querySelector(".dot").className = "dot " + level;
+  el.querySelector("span:last-child").textContent = text;
+}
+function table(id, head, rows, empty) {
+  const el = $(id);
+  if (!rows.length) { el.innerHTML = `<tr><td class="empty">${esc(empty)}</td></tr>`; return; }
+  el.innerHTML = "<thead><tr>" + head.map(([h, n]) => `<th class="${n ? "n" : ""}">${h}</th>`).join("") +
+    "</tr></thead><tbody>" + rows.map((r) => "<tr>" + r.map((c, i) => `<td class="${head[i][1] ? "n" : ""}">${c}</td>`).join("") + "</tr>").join("") + "</tbody>";
+}
+function feed(id, items, render, empty) {
+  $(id).innerHTML = items.length ? items.map(render).join("") : `<li class="empty">${esc(empty)}</li>`;
+}
+
+let S = null;
+
+function render(s) {
+  S = s;
+  pill("conn", s.connected ? "good" : "critical", s.connected ? "connected" : "disconnected");
+  const sess = s.session;
+  pill("sess", sess && sess.open ? "good" : "", sess ? `${sess.phase.toLowerCase()} · ${sess.date}` : "no session state");
+  pill("bot", s.bot.alive ? "good" : "warning", s.bot.alive ? "bot running" : "bot not logging");
+  const a = s.account;
+  const ll = a ? a.loss_level.replace("LOSS_LEVEL_", "").toLowerCase() : "unknown";
+  pill("loss", !a ? "" : a.in_cure || ll === "halt" ? "critical" : ll === "warning" ? "warning" : "good",
+    a ? (a.in_cure ? "IN CURE" : `loss: ${ll}`) : "loss level");
+
+  // pause controls
+  const paused = new Set(s.paused);
+  $("pauses").innerHTML = s.underlyings.map((u) =>
+    `<button class="${paused.has(u) ? "on" : ""}" data-u="${esc(u)}" data-p="${paused.has(u) ? 0 : 1}">${paused.has(u) ? "Resume" : "Pause"} ${esc(u)}</button>`).join("") +
+    (s.underlyings.length ? `<button data-u="*" data-p="${paused.size ? 0 : 1}">${paused.size ? "Resume all" : "Pause all"}</button>` : "");
+
+  // tiles
+  const t = s.greeks_total, lim = s.own_limits;
+  const tiles = [
+    ["Equity", a ? usd(a.equity) : "—", a ? `cash ${usd(a.cash)}` : ""],
+    ["Daily P&L", a ? signed(a.daily_pnl) : "—", a ? `bot soft stop −${usd(a.soft_loss)} · halt −${usd(a.loss_halt)}` : ""],
+    ["Gross options", usd(s.gross), `exchange cap ${usd(lim.gross)}`],
+    ["Net delta", usd(t.net_delta), `options ${usd(t.option_delta)} · stock ${usd(t.stock_delta)}`],
+    ["Vega", usd(t.vega), "per vol point"],
+    ["Gamma (sum |$Γ|)", usd(t.abs_gamma), `cap ${usd(lim.gamma)}`],
+    ["Theta", signed(t.theta), "per day"],
+  ];
+  $("tiles").innerHTML = tiles.map(([l, v, sub]) =>
+    `<div class="tile"><div class="label">${l}</div><div class="value">${v}</div><div class="sub">${esc(sub)}</div></div>`).join("");
+
+  feed("alerts", s.alerts, (x) => `<li><time>${hhmm(x.t)}</time><span class="dot ${esc(x.level)}"></span><span>${esc(x.text)}</span></li>`, "No alerts.");
+
+  drawPnl(s);
+
+  $("pnlSince").textContent = s.pnl.since ? `from recorded fills since ${new Date(s.pnl.since * 1000).toLocaleString()}` : "no fills recorded yet";
+  const pnlRows = (rows) => rows.map((r) => [esc(r.name), signed(r.pnl), usd(r.fees, 2) + (r.unmarked ? ` <span class="muted">(${r.unmarked} unmarked)</span>` : "")]);
+  table("pnlStrat", [["Strategy"], ["P&L", 1], ["Fees/rebates", 1]], pnlRows(s.pnl.by_strategy), "No fills yet.");
+  table("pnlUnd", [["Underlying"], ["P&L", 1], ["Fees/rebates", 1]], pnlRows(s.pnl.by_underlying), "No fills yet.");
+
+  table("greeks", [["Underlying"], ["Option Δ$", 1], ["Stock Δ$", 1], ["Net Δ$", 1], ["Γ$ /1%", 1], ["Vega $", 1], ["Theta $/day", 1]],
+    s.greeks.map((g) => [esc(g.underlying), usd(g.option_delta), usd(g.stock_delta), usd(g.net_delta), usd(g.gamma), usd(g.vega), signed(g.theta)]),
+    "No positions.");
+
+  table("limits", [["Limit"], ["Scope"], ["Used", 1], ["Ours", 1], ["Exchange", 1], ["", 0]],
+    s.limits.map((r) => {
+      const u = r.cap ? r.used / r.cap : 0, ours = s.risk_fraction;
+      const cls = u >= 1 ? "critical" : u >= 0.8 ? "serious" : u >= ours ? "warning" : "";
+      return [esc(r.kind.toLowerCase().replaceAll("_", " ")), esc(r.scope), usd(r.used), usd(r.ours), usd(r.cap),
+        `<div class="meter" title="${fmt(u * 100, 1)}% of exchange cap"><div class="fill ${cls}" style="width:${Math.min(100, u * 100)}%"></div><div class="tick" style="left:${ours * 100}%"></div></div>`];
+    }), "No limit rows from the exchange yet.");
+
+  table("positions", [["Instrument"], ["Qty", 1], ["Mark", 1], ["Value", 1], ["IV %", 1], ["Delta", 1], ["Vega", 1]],
+    s.positions.map((p) => [esc(p.instrument), fmt(p.qty), fmt(p.mark, 2), usd(p.value), p.iv == null ? "—" : fmt(p.iv, 1),
+      p.delta == null ? (p.greeks_missing ? '<span class="neg">missing</span>' : "—") : fmt(p.delta, 2), p.vega == null ? "—" : fmt(p.vega, 3)]),
+    "Flat: no positions.");
+
+  table("resting", [["Strategy"], ["Instrument"], ["Side"], ["Price", 1], ["Size", 1]],
+    s.resting.map((o) => [esc(o.strat), esc(o.instrument), esc(o.side), fmt(o.price, 2) + (o.stale ? ' <span class="neg">stale</span>' : ""), fmt(o.size)]),
+    "No resting orders.");
+
+  table("fills", [["Time"], ["Strategy"], ["Instrument"], ["Side"], ["Size", 1], ["Price", 1], ["Fee", 1]],
+    s.fills.map((f) => [hhmm(f.t), esc(f.strat), esc(f.instrument), esc(f.side), fmt(f.size), fmt(f.price, 2), signed(f.fee, 2)]),
+    "No fills yet.");
+
+  const ev = [...s.rejects.map((r) => ({t: r.t, cls: "critical", text: `${r.source}: ${r.text}`})),
+              ...s.bot.events.map((e) => ({t: e.t, cls: e.level === "WARNING" || e.level === "ERROR" ? "serious" : "", text: e.text}))]
+    .sort((x, y) => y.t - x.t).slice(0, 150);
+  feed("rejects", ev, (x) => `<li><time>${hhmm(x.t)}</time><span class="dot ${x.cls}"></span><span>${esc(x.text)}</span></li>`, "No rejects or bot events.");
+
+  syncStructForm(s);
+  $("jobs").innerHTML = s.jobs.map((j) => `<div class="note"><b>${esc(j.status)}</b> · ${esc(j.what)}<br>${j.log.map(esc).join("<br>")}</div>`).join("");
+  $("sendBtn").title = s.strat_id ? `sends as ${s.strat_id}` : "start the dashboard with --strat-id to send";
+}
+
+// ---------- P&L chart: one series, reference lines, crosshair tooltip ----------
+function drawPnl(s) {
+  const box = $("pnlChart"), svg = box.querySelector("svg"), tip = box.querySelector(".tip");
+  const pts = s.equity.filter((p) => p.daily_pnl != null);
+  const W = svg.clientWidth || 600, H = 220, L = 64, R = 12, T = 10, B = 24;
+  if (pts.length < 2) {
+    svg.innerHTML = `<text x="${W / 2}" y="${H / 2}" text-anchor="middle" fill="var(--muted)">Waiting for samples (every 30 s while connected)</text>`;
+    return;
+  }
+  const a = s.account || {};
+  const refs = [];
+  if (a.loss_warning) refs.push([-a.loss_warning, "var(--warning)"]);
+  const ys = pts.map((p) => p.daily_pnl);
+  let lo = Math.min(0, ...ys), hi = Math.max(0, ...ys);
+  // Show the warning line only once P&L is within reach of it; the halt line likewise.
+  if (a.loss_warning && lo < -a.loss_warning * 0.5) lo = Math.min(lo, -a.loss_warning);
+  if (a.loss_halt && lo < -a.loss_warning) { lo = Math.min(lo, -a.loss_halt); refs.push([-a.loss_halt, "var(--critical)"]); }
+  const pad = (hi - lo) * 0.08 || 100; lo -= pad; hi += pad;
+  const t0 = pts[0].t, t1 = pts[pts.length - 1].t;
+  const x = (t) => L + (W - L - R) * (t - t0) / (t1 - t0 || 1);
+  const y = (v) => T + (H - T - B) * (hi - v) / (hi - lo);
+  const ticks = niceTicks(lo, hi, 4);
+  let g = ticks.map((v) => `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="${v === 0 ? "var(--axis)" : "var(--grid)"}" stroke-width="1"/>` +
+    `<text x="${L - 6}" y="${y(v) + 4}" text-anchor="end" font-size="11" fill="var(--muted)">${usd(v)}</text>`).join("");
+  g += refs.filter(([v]) => v >= lo && v <= hi).map(([v, c]) => `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="${c}" stroke-dasharray="4 4" stroke-width="1.5"/>`).join("");
+  const xt = [t0, (t0 + t1) / 2, t1];
+  g += xt.map((t, i) => `<text x="${x(t)}" y="${H - 6}" text-anchor="${["start", "middle", "end"][i]}" font-size="11" fill="var(--muted)">${hhmm(t).slice(0, 5)}</text>`).join("");
+  const d = pts.map((p, i) => `${i ? "L" : "M"}${x(p.t).toFixed(1)},${y(p.daily_pnl).toFixed(1)}`).join("");
+  g += `<path d="${d}" fill="none" stroke="var(--series-1)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+  const last = pts[pts.length - 1];
+  g += `<circle cx="${x(last.t)}" cy="${y(last.daily_pnl)}" r="4" fill="var(--series-1)" stroke="var(--surface)" stroke-width="2"/>`;
+  g += `<line id="xh" y1="${T}" y2="${H - B}" stroke="var(--axis)" stroke-width="1" visibility="hidden"/><circle id="xd" r="4" fill="var(--series-1)" stroke="var(--surface)" stroke-width="2" visibility="hidden"/>`;
+  g += `<rect x="${L}" y="${T}" width="${W - L - R}" height="${H - T - B}" fill="transparent" id="hit"/>`;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.innerHTML = g;
+  const hit = svg.querySelector("#hit"), xh = svg.querySelector("#xh"), xd = svg.querySelector("#xd");
+  hit.onmousemove = (e) => {
+    const r = svg.getBoundingClientRect(), mx = (e.clientX - r.left) * W / r.width;
+    const t = t0 + (mx - L) / (W - L - R) * (t1 - t0);
+    let p = pts[0]; for (const q of pts) if (Math.abs(q.t - t) < Math.abs(p.t - t)) p = q;
+    xh.setAttribute("x1", x(p.t)); xh.setAttribute("x2", x(p.t)); xh.setAttribute("visibility", "visible");
+    xd.setAttribute("cx", x(p.t)); xd.setAttribute("cy", y(p.daily_pnl)); xd.setAttribute("visibility", "visible");
+    tip.style.display = "block";
+    tip.innerHTML = `${hhmm(p.t)}<br><b>${usd(p.daily_pnl)}</b> daily P&L<br>equity ${usd(p.equity)}`;
+    const px = x(p.t) * r.width / W;
+    tip.style.left = Math.min(px + 12, r.width - 150) + "px"; tip.style.top = "8px";
+  };
+  hit.onmouseleave = () => { tip.style.display = "none"; xh.setAttribute("visibility", "hidden"); xd.setAttribute("visibility", "hidden"); };
+}
+function niceTicks(lo, hi, n) {
+  const step0 = (hi - lo) / n, mag = 10 ** Math.floor(Math.log10(step0)), err = step0 / mag;
+  const step = (err >= 7.5 ? 10 : err >= 3.5 ? 5 : err >= 1.5 ? 2 : 1) * mag;
+  const out = []; for (let v = Math.ceil(lo / step) * step; v <= hi; v += step) out.push(Math.round(v / step) * step);
+  return out;
+}
+
+// ---------- structures ----------
+const NEED = {call: 1, put: 1, straddle: 1, strangle: 2, risk_reversal: 2, call_spread: 2, put_spread: 2, call_butterfly: 3, put_butterfly: 3};
+let strikeList = [], lastQuery = null;
+const form = $("structForm");
+function syncStructForm(s) {
+  const u = form.underlying, e = form.expiry;
+  if (u.options.length !== s.underlyings.length) {
+    u.innerHTML = s.underlyings.map((x) => `<option>${esc(x)}</option>`).join("");
+  }
+  const ex = (s.expiries[u.value] || []).map((x) => x.expiry);
+  if (e.dataset.key !== u.value + ex.join()) {
+    e.dataset.key = u.value + ex.join();
+    e.innerHTML = ex.map((x) => `<option>${esc(x)}</option>`).join("");
+    refreshStrikes();
+  }
+}
+function strikeInputs() {
+  const n = NEED[form.structure.value];
+  const cur = [...document.querySelectorAll("#strikes select")].map((x) => x.value);
+  $("strikes").innerHTML = Array.from({length: n}, (_, i) =>
+    `<label>Strike ${n > 1 ? i + 1 : ""}<select data-i="${i}">${strikeList.map((k) => `<option>${k}</option>`).join("")}</select></label>`).join("");
+  const sel = [...document.querySelectorAll("#strikes select")];
+  sel.forEach((x, i) => { if (cur[i] && strikeList.includes(Number(cur[i]))) x.value = cur[i]; });
+}
+async function refreshStrikes() {
+  if (!form.expiry.value) { strikeList = []; strikeInputs(); return; }
+  const qs = new URLSearchParams({underlying: form.underlying.value, expiry: form.expiry.value});
+  const r = await fetch("/api/strikes?" + qs).then((x) => x.json()).catch(() => null);
+  strikeList = (r && r.strikes) || [];
+  strikeInputs();
+  // Default the strikes around the middle of the list (near the money).
+  const sel = [...document.querySelectorAll("#strikes select")], mid = Math.floor(strikeList.length / 2);
+  sel.forEach((x, i) => { if (strikeList.length) x.value = strikeList[Math.min(strikeList.length - 1, mid + i)]; });
+}
+function query() {
+  return {underlying: form.underlying.value, expiry: form.expiry.value, structure: form.structure.value,
+    direction: Number(form.direction.value), qty: Number(form.qty.value),
+    strikes: [...document.querySelectorAll("#strikes select")].map((x) => Number(x.value)), vol: form.vol.value};
+}
+async function priceIt() {
+  const q = query(), r = await post("/api/structure/price", q);
+  $("sendBtn").disabled = true;
+  if (r.error) { $("structOut").innerHTML = `<div class="neg">${esc(r.error)}</div>`; return; }
+  lastQuery = q;
+  const legsHtml = r.legs.map((l) => `<tr><td>${esc(l.contract)}</td><td class="n">${l.qty > 0 ? "+" : ""}${l.qty}</td><td class="n">${fmt(l.bid, 2)}</td><td class="n">${fmt(l.ask, 2)}</td><td class="n">${fmt(l.mark, 3)}</td><td class="n">${fmt(l.fair, 3)}</td><td class="n">${l.iv == null ? "—" : fmt(l.iv, 1)}</td><td>${l.tradable ? "" : '<span class="neg">not trading</span>'}</td></tr>`).join("");
+  const t = r.total;
+  $("structOut").innerHTML = `<div class="scroll"><table><thead><tr><th>Leg</th><th class="n">Qty</th><th class="n">Wall bid</th><th class="n">Wall ask</th><th class="n">Mark</th><th class="n">BS fair</th><th class="n">IV %</th><th></th></tr></thead><tbody>${legsHtml}</tbody></table></div>
+    <div class="tiles" style="margin-top:10px">
+      <div class="tile"><div class="label">Cost at the wall</div><div class="value">${usd(t.wall)}</div><div class="sub">+ fees ${usd(t.fees, 2)} (positive = we pay)</div></div>
+      <div class="tile"><div class="label">At the marks</div><div class="value">${usd(t.mark)}</div></div>
+      <div class="tile"><div class="label">BS fair</div><div class="value">${usd(t.fair)}</div><div class="sub">${form.vol.value ? form.vol.value + "% vol" : "published IV per leg"}</div></div>
+      <div class="tile"><div class="label">Edge vs fair</div><div class="value">${r.complete ? signed(t.edge_vs_fair) : "—"}</div><div class="sub">vs marks ${r.complete ? usd(t.edge_vs_mark) : "—"}</div></div>
+      <div class="tile"><div class="label">Greeks</div><div class="value" style="font-size:14px">Δ ${fmt(t.delta, 1)} sh · Γ ${fmt(t.gamma, 2)}</div><div class="sub">vega ${usd(t.vega)} · theta ${usd(t.theta)}/day</div></div>
+    </div>`;
+  $("structNote").textContent = r.complete ? "Legs go one at a time, the biggest first, each crossing at the wall; the first leg that does not fill completely stops the rest." : "A leg has no quote, mark or Greeks: it cannot be sent.";
+  $("sendBtn").disabled = !(r.complete && S && S.strat_id);
+}
+$("priceBtn").onclick = priceIt;
+$("sendBtn").onclick = async () => {
+  if (!lastQuery) return;
+  const q = lastQuery;
+  if (!confirm(`Send ${q.direction > 0 ? "BUY" : "SELL"} ${q.qty} ${q.structure} ${q.underlying} ${q.expiry} ${q.strikes.join("/")} as ${S.strat_id}?\nEach leg crosses at the wall.`)) return;
+  $("sendBtn").disabled = true;
+  const r = await post("/api/structure/execute", {...q, confirm: true});
+  $("structNote").textContent = r.error ? r.error : `${r.status}`;
+};
+form.underlying.onchange = () => { form.expiry.dataset.key = ""; if (S) syncStructForm(S); };
+form.expiry.onchange = refreshStrikes;
+form.structure.onchange = strikeInputs;
+
+$("pauses").onclick = async (e) => {
+  const b = e.target.closest("button"); if (!b) return;
+  await post("/api/control", {underlying: b.dataset.u, paused: b.dataset.p === "1"});
+  tick();
+};
+$("cancelAll").onclick = async () => {
+  if (!confirm("Mass cancel EVERY resting order of the team (all strategies, all instruments)?")) return;
+  await post("/api/cancel-all");
+};
+
+async function tick() {
+  try { render(await (await fetch("/api/state")).json()); }
+  catch (err) { pill("conn", "critical", "dashboard server unreachable"); }
+}
+tick(); setInterval(tick, 1000);
+</script>
+</body>
+</html>

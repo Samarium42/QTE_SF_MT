@@ -1,0 +1,11 @@
+# Secrets: the team token lives in .env and must never be committed.
+.env
+.env.*
+# Local state and output
+.venv/
+__pycache__/
+.pytest_cache/
+logs/
+control.json
+control.tmp
+.DS_Store
