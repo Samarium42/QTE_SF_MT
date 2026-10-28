@@ -120,24 +120,31 @@ def hedge_shares(
     threshold: Decimal,
     max_order: Decimal,
     tolerance: Decimal,
+    buffer: Decimal = Decimal(0),
 ) -> int:
     """Signed shares of the underlying to trade so the stock offsets the options' delta.
 
     Nothing until the unhedged dollar delta passes `threshold`. The target keeps the stock
     a qualifying hedge (Rule 6006): opposite in sign to the option delta and no bigger than
-    it plus `tolerance`. Each order is capped at `max_order` dollars."""
+    it plus `tolerance`. Each order is capped at `max_order` dollars.
+
+    Only the delta beyond `buffer` is hedged. Stock stops qualifying the moment fills take the
+    option delta through zero against it, so a buffer the size of the fills that can land
+    between two hedges keeps the stock on the right side."""
     if spot <= 0:
         return 0
+    cap = int(max_order / spot)
+    # A stock position outside the qualifying band is a breach whatever the net delta, so
+    # bring it back to the band's nearest edge before applying the threshold.
+    band = int(((abs(option_delta) + tolerance) / spot).to_integral_value(rounding="ROUND_FLOOR"))
+    lo, hi = (-band, 0) if option_delta > 0 else (0, band) if option_delta < 0 else (0, 0)
+    if not lo <= stock_shares <= hi:
+        trade = min(max(stock_shares, lo), hi) - stock_shares
+        return max(-cap, min(cap, trade))
     stock_notional = stock_shares * spot
     if abs(option_delta + stock_notional) < threshold:
         return 0
-    target = -option_delta / spot
-    # Never hold stock on the same side as the option delta, nor beyond |D| + tolerance.
-    limit_shares = (abs(option_delta) + tolerance) / spot
-    if target > limit_shares:
-        target = limit_shares
-    if target < -limit_shares:
-        target = -limit_shares
-    trade = int(target.to_integral_value()) - stock_shares
-    cap = int(max_order / spot)
+    room = max(Decimal(0), abs(option_delta) - buffer)
+    target = (-room if option_delta > 0 else room) / spot
+    trade = int(target.to_integral_value(rounding="ROUND_DOWN")) - stock_shares
     return max(-cap, min(cap, trade))

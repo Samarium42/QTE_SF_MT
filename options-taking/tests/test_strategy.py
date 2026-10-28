@@ -88,6 +88,11 @@ def test_hedge_offsets_delta_and_stays_qualifying():
     assert hedge_shares(Decimal(50000), 0, Decimal(650), **kw) == 0  # under threshold
     # Never on the same side as the option delta: flat options unwind a short hedge.
     assert hedge_shares(Decimal(0), -500, Decimal(650), **kw) == 500
+    # Short stock against a short option delta is not a hedge, even under the threshold.
+    assert hedge_shares(Decimal(-46000), -33, Decimal(770), **kw) == 33
+    # With a buffer only the delta beyond it is hedged, so a fill cannot strand the stock.
+    assert hedge_shares(d, 0, Decimal(650), buffer=Decimal(200000), **kw) == -192
+    assert hedge_shares(Decimal(150000), 0, Decimal(650), buffer=Decimal(200000), **kw) == 0
 
 
 from strategy.arb import Strike, scan  # noqa: E402

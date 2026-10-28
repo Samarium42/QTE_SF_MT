@@ -54,6 +54,9 @@ class Settings:
     # Delta hedging in the underlying.
     hedge_threshold: Decimal = Decimal("100_000")  # dollars of unhedged delta
     hedge_cooldown_seconds: float = 5.0
+    # Delta left unhedged, in fills of quote_size at this delta: keeps stock qualifying (Rule 6006).
+    hedge_buffer_fills: int = 2
+    hedge_buffer_delta: Decimal = Decimal("0.6")
 
     # Stop quoting this long before the session's close.
     stop_before_close_seconds: int = 10 * 60
@@ -62,4 +65,4 @@ class Settings:
     taker_fee_per_contract: Decimal = Decimal("0.30")
 
     # Ask the exchange for the account this often.
-    account_query_seconds: float = 30.0
+    account_query_seconds: float = 5.0

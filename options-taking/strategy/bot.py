@@ -72,7 +72,7 @@ from qte_sdk.units import to_decimal
 from strategy.arb import Strike, scan
 from strategy.config import Settings
 from strategy.pricing import is_inside, padding, passive_quotes, reach
-from strategy.risk import Exposure, Leg, SoftLimits, adds_risk, hedge_shares, measure
+from strategy.risk import MULTIPLIER, Exposure, Leg, SoftLimits, adds_risk, hedge_shares, measure
 
 log = logging.getLogger("sf_bot")
 
@@ -642,6 +642,8 @@ class Bot:
                 threshold=self.cfg.hedge_threshold,
                 max_order=lim.max_hedge_order,
                 tolerance=lim.hedge_tolerance,
+                buffer=(self.cfg.hedge_buffer_fills * self.cfg.quote_size * MULTIPLIER
+                        * self.cfg.hedge_buffer_delta * to_decimal(spot)),
             )
             book = self.books.get(underlying)
             if shares == 0 or book is None or not book.bid_levels or not book.ask_levels:
@@ -709,11 +711,20 @@ async def run(args: argparse.Namespace) -> int:
         loop.add_signal_handler(signal.SIGINT, task.cancel)
         loop.add_signal_handler(signal.SIGTERM, task.cancel)
 
+    # A ReconnectingSession can be iterated only once, and cancelling the loop that iterates
+    # it ends the iteration; so a pump task owns it and the shutdown keeps reading the queue.
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def pump() -> None:
+        async for event in session:
+            await queue.put(event)
+
     async with session:
+        pumping = asyncio.create_task(pump())
         try:
             async with asyncio.timeout(args.seconds):
-                async for event in session:
-                    await bot.on_event(event)
+                while True:
+                    await bot.on_event(await queue.get())
         except TimeoutError:
             log.info("time is up: cancelling this strategy's quotes")
         except asyncio.CancelledError:
@@ -724,14 +735,13 @@ async def run(args: argparse.Namespace) -> int:
             await bot.cancel_all()
             with contextlib.suppress(TimeoutError):
                 async with asyncio.timeout(5):
-                    async for event in session:
-                        await bot.on_event(event)
-                        if bot.own_count() == 0:
-                            break
-            left = bot.own_count()
-            if left:
-                log.error("%d orders may still rest: check the console and cancel them", left)
-                return 1
+                    while bot.own_count():
+                        await bot.on_event(await queue.get())
+        pumping.cancel()
+        left = bot.own_count() if not args.dry_run else 0
+        if left:
+            log.error("%d orders may still rest: check the console and cancel them", left)
+            return 1
     log.info("stopped cleanly")
     return 0
 
