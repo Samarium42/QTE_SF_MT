@@ -79,6 +79,20 @@ from qte_sdk.reconnect import ReconnectingSession
 from qte_sdk.resting import RestingOrders
 from qte_sdk.units import to_decimal
 
+from dashboard.analytics import (
+    MARKOUT_HORIZONS,
+    DayResult,
+    Holding,
+    Quote,
+    SmilePoint,
+    fit_smile,
+    idle_accrual,
+    markout,
+    mispricings,
+    scenario_grid,
+    sharpe,
+    smile_iv,
+)
 from dashboard.structures import LegSpec, execution_order, legs
 from strategy.bs import black76
 from strategy.config import Settings
@@ -95,6 +109,10 @@ SIDE = {BUY: "BUY", SELL: "SELL"}
 ACCOUNT_EVERY = 5.0  # seconds; an account query is free (not an order message)
 EQUITY_EVERY = 30.0
 LEG_WAIT = 2.0  # seconds to wait for a leg's fills before giving up on its remainder
+STARTING_EQUITY = 2_500_000.0  # E0: the term's reset opening equity (Rule 9001)
+SOFR = 0.043  # approximate; only sets the idle-cash benchmark the Sharpe subtracts
+SPOT_MOVES = [-0.05, -0.02, -0.01, 0.0, 0.01, 0.02, 0.05]
+VOL_MOVES = [-5.0, -2.0, 0.0, 2.0, 5.0]
 
 
 def d(micros: int | None) -> float | None:
@@ -174,6 +192,9 @@ class Hub:
         self.bot_last_line = 0.0
         self.bot_status = ""
         self.started = time.time()
+        self.session_date: str | None = None  # of the latest account state
+        self.daily: dict[str, dict] = {}  # session date -> last daily P&L and equity seen
+        self.markouts: dict[str, dict[str, float]] = {}  # exec_id -> {horizon: dollars}
         self.load_history()
 
     # ---------- history on disk ----------
@@ -187,6 +208,16 @@ class Hub:
                     if f["exec_id"] not in self.fill_ids:
                         self.fill_ids.add(f["exec_id"])
                         self.fills.append(f)
+        path = LOGS / "daily.json"
+        if path.exists():
+            with contextlib.suppress(json.JSONDecodeError):
+                self.daily = json.loads(path.read_text())
+        path = LOGS / "markouts.jsonl"
+        if path.exists():
+            for line in path.read_text().splitlines():
+                with contextlib.suppress(json.JSONDecodeError, KeyError):
+                    r = json.loads(line)
+                    self.markouts[r["exec_id"]] = r["markouts"]
         path = LOGS / f"equity-{date.today().isoformat()}.jsonl"
         if path.exists():
             for line in path.read_text().splitlines():
@@ -261,6 +292,8 @@ class Hub:
             self.positions = {p.instrument: p.quantity for p in message.positions}
             self.position_prices = {p.instrument: p.price for p in message.positions}
             self.valuation_basis = ValuationBasis.Name(message.valuation_basis)
+            if message.HasField("session_date"):
+                self.session_date = message.session_date
             if message.HasField("summary"):
                 before = self.summary
                 self.summary = message.summary
@@ -307,12 +340,27 @@ class Hub:
         }
         self.fills.append(row)
         self.append("fills.jsonl", row)
+        asyncio.get_running_loop().create_task(self.track_markout(row))
         if m.HasField("order_price"):
             watch = self.watches.get((m.instrument, m.side, m.order_price))
             if watch is not None and (not m.HasField("strat_id") or m.strat_id == self.strat_id):
                 watch.filled += m.fill_size
                 if m.remaining_size == 0 or watch.filled >= watch.size:
                     watch.ended.set()
+
+    async def track_markout(self, fill: dict) -> None:
+        """The fill's P&L against the mark 1 s, 10 s, 60 s and 5 min later."""
+        out: dict[str, float] = {}
+        waited = 0.0
+        for horizon in MARKOUT_HORIZONS:
+            await asyncio.sleep(horizon - waited)
+            waited = horizon
+            mark = self.mark(fill["instrument"])
+            if mark is not None and fill["price"] is not None:
+                out[str(horizon)] = markout(fill["side"], fill["price"], mark, fill["size"],
+                                            multiplier(fill["instrument"]))
+                self.markouts[fill["exec_id"]] = dict(out)
+        self.append("markouts.jsonl", {"exec_id": fill["exec_id"], "markouts": out})
 
     def on_order_event(self, message: object) -> None:
         if isinstance(message, Reject):
@@ -352,6 +400,12 @@ class Hub:
                    "daily_pnl": d(self.summary.daily_pnl)}
             self.equity.append(row)
             self.append(f"equity-{date.today().isoformat()}.jsonl", row)
+            if self.session_date:
+                self.daily[self.session_date] = {"pnl": row["daily_pnl"], "equity": row["equity"],
+                                                 "t": row["t"]}
+                tmp = LOGS / "daily.tmp"
+                tmp.write_text(json.dumps(self.daily, indent=1))
+                tmp.replace(LOGS / "daily.json")
         self.tail_bot_log()
 
     # ---------- the bot's log ----------
@@ -546,6 +600,137 @@ class Hub:
         return sorted({d(parse_option_symbol(c.instrument).strike)
                        for c in chain_contracts(self.chain, underlying=underlying, expiry=expiry)})
 
+    # ---------- analytics ----------
+
+    def analytics(self) -> dict:
+        return {
+            "sharpe": self.sharpe_view(),
+            "smiles": self.smile_view(),
+            "scenarios": self.scenario_view(),
+            "markouts": self.markout_view(),
+            "expiries": self.expiry_view(),
+            "bot": self.bot_file(),
+        }
+
+    def sharpe_view(self) -> dict:
+        days, prev = [], None
+        for day in sorted(self.daily):
+            gap = 1 if prev is None else max(1, (date.fromisoformat(day) - date.fromisoformat(prev)).days)
+            prev = day
+            days.append(DayResult(day, self.daily[day]["pnl"],
+                                  idle_accrual(STARTING_EQUITY, SOFR, gap)))
+        out = sharpe(days, STARTING_EQUITY)
+        out.update({"e0": STARTING_EQUITY, "sofr": SOFR})
+        return out
+
+    def smile_points(self, underlying: str, expiry: date) -> list[tuple[SmilePoint, Quote]]:
+        out = []
+        if self.chain is None:
+            return out
+        t = years_to(expiry)
+        for c in chain_contracts(self.chain, underlying=underlying, expiry=expiry):
+            g = self.greeks_of(c.instrument)
+            if g is None or not g["iv"] or not g["forward"]:
+                continue
+            sym = parse_option_symbol(c.instrument)
+            point = SmilePoint(c.instrument, sym.right == "C", sym.strike / 1e6, g["forward"], t,
+                               g["iv"], g["vega"] or 0.0)
+            book = self.books.get(c.instrument)
+            live = book is not None and trading_state(book) == OPTION_TRADING and \
+                c.instrument not in self.books.stale
+            bid = d(book.bid_levels[0].price) if live and book.bid_levels else None
+            ask = d(book.ask_levels[0].price) if live and book.ask_levels else None
+            out.append((point, Quote(point, bid, ask, self.mark(c.instrument))))
+        return out
+
+    def smile_view(self) -> list[dict]:
+        fee = float(self.cfg.taker_fee_per_contract) / 100
+        views = []
+        if self.chain is None:
+            return views
+        for e in self.chain.expiries:
+            expiry = expiry_date(e)
+            pairs = self.smile_points(e.underlying, expiry)
+            # Out-of-the-money options carry the smile: their IVs are the cleaner ones.
+            otm = [p for p, _ in pairs if (p.call and p.strike >= p.forward) or
+                   (not p.call and p.strike <= p.forward)]
+            fit = fit_smile(otm) or fit_smile([p for p, _ in pairs])
+            pts = [{"instrument": p.instrument, "strike": p.strike, "call": p.call, "x": p.x,
+                    "iv": p.iv, "fit": smile_iv(fit, p.x) if fit else None} for p, _ in pairs]
+            curve = []
+            if fit and pts:
+                lo, hi = min(p["x"] for p in pts), max(p["x"] for p in pts)
+                curve = [{"x": lo + (hi - lo) * i / 40, "iv": smile_iv(fit, lo + (hi - lo) * i / 40)}
+                         for i in range(41)]
+            views.append({
+                "underlying": e.underlying, "expiry": expiry.isoformat(),
+                "reducing_only": e.reducing_only, "points": pts, "curve": curve,
+                "forward": pairs[0][0].forward if pairs else None,
+                "mispricings": mispricings([q for _, q in pairs], fit, fee)[:25] if fit else [],
+            })
+        return views
+
+    def holdings(self) -> list[Holding]:
+        out = []
+        for instrument, qty in self.positions.items():
+            if qty == 0:
+                continue
+            if is_option_symbol(instrument):
+                g = self.greeks_of(instrument)
+                if g is None or not g["forward"]:
+                    continue
+                sym = parse_option_symbol(instrument)
+                out.append(Holding(sym.underlying, qty, sym.right == "C", sym.strike / 1e6,
+                                   g["forward"], years_to(sym.expiry), g["iv"]))
+            else:
+                spot = self.spot(instrument)
+                if spot is not None:
+                    out.append(Holding(instrument, qty, None, spot=spot))
+        return out
+
+    def scenario_view(self) -> dict:
+        h = self.holdings()
+        return {"spot_moves": SPOT_MOVES, "vol_moves": VOL_MOVES,
+                "grid": scenario_grid(h, SPOT_MOVES, VOL_MOVES) if h else None,
+                "holdings": len(h)}
+
+    def markout_view(self) -> dict:
+        rows = []
+        for f in list(self.fills)[-300:]:
+            m = self.markouts.get(f["exec_id"])
+            if m:
+                rows.append({**f, "markouts": m})
+        summary = {}
+        for h in MARKOUT_HORIZONS:
+            vals = [r["markouts"][str(h)] for r in rows if str(h) in r["markouts"]]
+            summary[str(h)] = {"total": sum(vals), "count": len(vals),
+                               "avg": sum(vals) / len(vals) if vals else None}
+        return {"horizons": list(MARKOUT_HORIZONS), "summary": summary, "fills": rows[-50:][::-1]}
+
+    def expiry_view(self) -> list[dict]:
+        out = []
+        if self.chain is None:
+            return out
+        today = datetime.now(NEW_YORK).date()
+        for e in self.chain.expiries:
+            expiry = expiry_date(e)
+            held = sum(abs(q) for i, q in self.positions.items()
+                       if q and is_option_symbol(i) and parse_option_symbol(i).expiry == expiry
+                       and parse_option_symbol(i).underlying == e.underlying)
+            dte = (expiry - today).days
+            out.append({"underlying": e.underlying, "expiry": expiry.isoformat(), "dte": dte,
+                        "reducing_only": e.reducing_only, "contracts_held": held,
+                        "reducing_only_in": max(0, dte - 5), "closed_in": max(0, dte - 3)})
+        return out
+
+    def bot_file(self) -> dict | None:
+        try:
+            data = json.loads((LOGS / "bot-status.json").read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
+        data["age"] = time.time() - data.get("t", 0)
+        return data
+
     # ---------- structures ----------
 
     def price_structure(self, q: dict) -> dict:
@@ -677,6 +862,10 @@ def make_app(hub: Hub) -> web.Application:
     @routes.get("/")
     async def index(_: web.Request) -> web.FileResponse:
         return web.FileResponse(STATIC / "index.html")
+
+    @routes.get("/api/analytics")
+    async def analytics(_: web.Request) -> web.Response:
+        return web.json_response(hub.analytics())
 
     @routes.get("/api/state")
     async def state(_: web.Request) -> web.Response:

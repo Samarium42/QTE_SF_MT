@@ -34,24 +34,27 @@ python -m dashboard.server                    # then open http://127.0.0.1:8050
 python -m dashboard.server --strat-id <ID>    # also allows sending structures from the page
 ```
 
-The dashboard has its own SDK connection, and the page is served on localhost only. It shows:
+The dashboard has its own SDK connection, and the page is served on localhost only. A banner at the top says in plain English what needs attention: a disconnect, the cure, a loss level, the bot off or in dry run, paused underlyings, an expiry to roll. Every panel has a **?** that explains it. There's a light/dark/system theme, and 🔔 turns on desktop notifications for serious alerts.
 
-- **Account:** equity, daily P&L against the bot's soft stop and the exchange's warning/halt, loss level, cure.
-- **Risk:** Greeks per underlying (Δ$, Γ$ per 1%, vega $, theta $/day) and gross. Each exchange limit row shows usage against our cap (`risk_fraction`) and the exchange cap.
-- **P&L:** a daily P&L chart (sampled every 30 s to `logs/equity-DATE.jsonl`). P&L is split by strategy and underlying from the fills recorded in `logs/fills.jsonl`.
-- **Orders:** positions, the team's resting orders, fills, rejects and bot events (tailed from `logs/bot-*.log`).
-- **Alerts:** risk notices, disconnects, loss-level changes, limits over 80%, and bot warnings.
-- **Controls:** Pause/Resume per underlying writes `control.json`, which the bot reads every grid step; a paused underlying gets no quotes but is still hedged. **Cancel all** sends a mass cancel, which removes *every* team order on every strategy.
-- **Structures:** straddle, strangle, risk reversal, verticals and butterflies. Each is priced at the wall (taker plus fees) against Black-76 on the published forward, using the published IV or a vol override. Legs are sent one at a time, biggest first, and the first leg that doesn't fill completely stops the rest.
+| Tab | What it shows |
+|---|---|
+| **Overview** | Equity, today's P&L against the halt, the score's Sharpe, net delta, vega, gamma and gross; a P&L chart with the loss warning and halt lines; alerts; the score tracker; an expiry countdown. |
+| **Risk** | Greeks per underlying, each exchange limit against our cap and the exchange cap, and a **scenario grid** (book P&L for spot ±1/2/5% × vol ±2/5 points, repriced with Black-76). |
+| **Orders & fills** | Positions, the team's resting orders, fills, P&L by strategy and underlying, **fill markouts** (P&L vs the mark 1 s, 10 s, 1 min and 5 min after each fill, to detect adverse selection), and rejects and bot events. |
+| **Volatility** | The **IV smile** per expiry against ln(K/F)/√t, with a vega-weighted quadratic fit, plus a **mispricing scanner**: taker edge at the wall against Black-76 at the smile vol, after fees. |
+| **Structures** | Straddle, strangle, risk reversal, verticals and butterflies, priced at the wall against Black-76. Legs are sent biggest first, and the first leg that doesn't fill stops the rest. |
+| **Bot & controls** | Bot state from `logs/bot-status.json` (live or dry run, message budget use against 2,400/min, quoting, paper fills); Pause/Resume per underlying via `control.json` (the bot keeps hedging); run commands; the bot log. **Cancel all** in the header mass-cancels every team order. |
+
+**Score tracker:** follows Rule 9001. Each day's excess return is the daily P&L minus the idle-cash accrual (approximate SOFR, set in `dashboard/server.py`), divided by the fixed $2.5M. The Sharpe is √252 × mean / stdev. Days are recorded to `logs/daily.json` while the dashboard runs, and it needs at least two days.
 
 ## The strategy: passive print capture
 
 Options Taking is scored on **70% Sharpe + 30% net P&L**, and positions are marked at the live mid. Crossing the wall costs at least the padding (≥ $0.02 a side, more for high-vega contracts) plus a $0.30/contract fee, so taking liquidity starts behind the mark.
 
-Resting orders, on the other hand, are filled by **real market prints at our own limit price** (Rules 2007/6002). A bid qualifies for a sell print at P when the bid ≥ P − ¼·padding. The bot therefore rests:
+Resting orders, on the other hand, are filled by **real market prints at our own limit price** (Rules 2007/6002). A bid qualifies for a sell print at P when the bid ≥ P − κ·padding, with κ = 0.45 from Revision 4 (28 Oct 2026; it was 0.25). The bot therefore rests:
 
-- a bid at about *live bid − ¼ padding*, below the mark, and
-- an offer at about *live ask + ¼ padding*, above the mark,
+- a bid at about *live bid − 0.45 padding*, below the mark, and
+- an offer at about *live ask + 0.45 padding*, above the mark,
 
 on the ~6 strikes nearest the forward (calls and puts) in the front expiry of SPY and GOOGL. Every fill is at a price better than the mark, plus a **$0.20/contract maker rebate**. Fills are capped at 25 contracts per print, shared with all teams, and assigned makers (Tier M) get priority at equal prices.
 
@@ -73,7 +76,7 @@ Things to watch on the first live run: the fill rate, whether fills come mostly 
 ## Rules: the parts that matter for us
 
 - **Arm:** Options Taking (3 teams). SPY and GOOGL options only; stock **only as a qualifying hedge**. Starting capital $2.5M, reset each term. Max option order 25 contracts; max hedge order $400k.
-- **Session:** 09:30–16:00 New York. In the practice week (26–30 Oct) that's 13:30–20:00 London. Every order is cancelled at the close; positions carry overnight. Term ends 4 Dec: trading stops 5 minutes before the close and everything is closed at official marks.
+- **Session:** 09:30–16:00 New York. In the practice week (26–30 Oct) that's 14:30–21:00 London since the UK clocks changed on 25 Oct (Rule 1005). Every order is cancelled at the close; positions carry overnight. Term ends 4 Dec: trading stops 5 minutes before the close and everything is closed at official marks.
 - **Orders:** one resting order per instrument/side/price per *team* (across strategies). Order delay 150 ms; cancel/amend only after 50 ms rest. Resting orders must sit **strictly inside** the wall; touching it makes them stale, purged after 750 ms. Price guard: buys ≤ max(105% mark, wall offer), sells ≥ min(95% mark, wall bid).
 - **Options wall:** padding max($0.02, 0.20 × vega) per side, minimum 8¢ wide, 10 contracts at one level, refreshed every 100 ms. Monthly expiries; ≤ 25 strikes per expiry with call delta in [0.10, 0.90]; contracts leaving the window are reducing-only. At 5 DTE the next expiry opens and the old one goes reducing-only; at ~3 DTE it is closed at official marks. No exercise.
 - **Suspension:** a frozen or absent option mark suspends matching, and resting orders go stale. Invalid Greeks make a contract reducing-only.

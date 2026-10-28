@@ -20,12 +20,12 @@ def test_padding_floor_and_vega_scaling():
     assert padding(m("0.61")) == m("0.13")  # 0.122 rounds up to a cent
 
 
-def test_quotes_sit_a_quarter_padding_outside_the_live_quote():
-    # live 5.00 / 5.10, mark 5.05, vega 0.60 -> pad 0.12, wall 4.88 / 5.22
+def test_quotes_sit_kappa_paddings_outside_the_live_quote():
+    # live 5.00 / 5.10, mark 5.05, vega 0.60 -> pad 0.12, reach 0.45 * 0.12 = 0.054
     q = passive_quotes(wall_bid=m("4.88"), wall_ask=m("5.22"), mark=m("5.05"),
                        vega=m("0.60"), tick=TICK, min_edge=EDGE)
-    assert q.bid == m("4.97")  # 5.00 - 0.03
-    assert q.ask == m("5.13")  # 5.10 + 0.03
+    assert q.bid == m("4.95")  # ceil(5.00 - 0.054) to a cent: still qualifies
+    assert q.ask == m("5.15")  # floor(5.10 + 0.054)
 
 
 def test_quotes_keep_edge_when_band_was_widened():

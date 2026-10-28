@@ -24,6 +24,7 @@ import logging
 import signal
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
@@ -70,7 +71,7 @@ from qte_sdk.units import to_decimal
 
 from strategy.arb import Strike, scan
 from strategy.config import Settings
-from strategy.pricing import is_inside, padding, passive_quotes
+from strategy.pricing import is_inside, padding, passive_quotes, reach
 from strategy.risk import Exposure, Leg, SoftLimits, adds_risk, hedge_shares, measure
 
 log = logging.getLogger("sf_bot")
@@ -78,6 +79,7 @@ log = logging.getLogger("sf_bot")
 BUDGET_REJECTS = frozenset(
     {ReasonCodes.MESSAGE_BUDGET_EXCEEDED, ReasonCodes.BURST_CAP_EXCEEDED}
 )
+STATUS = Path("logs/bot-status.json")  # read by the dashboard
 CONTROL = Path("control.json")  # written by the dashboard: {"paused": ["SPY", ...]}
 PENDING_TIMEOUT = 3.0  # seconds before an unanswered message no longer blocks its quote
 BUDGET_PAUSE = 61.0
@@ -127,6 +129,8 @@ class Bot:
         self.paper_fills = 0
         self.last_arb_scan = 0.0
         self.paused: set[str] = set()  # underlyings paused from the dashboard
+        self.sent_times: deque[float] = deque()  # order messages in the last minute
+        self.last_status_file = 0.0
         self.control_mtime = 0.0
         self.arb_seen: set[tuple[str, str]] = set()
         self.paper_edge = Decimal(0)  # dollars against the mark, before the maker rebate
@@ -254,12 +258,12 @@ class Bot:
 
     def paper_fill(self, trades: Trades) -> None:
         """In a dry run, count the prints that would have filled the quotes we would rest: a
-        sell print at P fills a bid at or above P - padding/4, and a buy print an offer."""
+        sell print at P fills a bid at or above P - kappa*padding, and a buy print an offer."""
         g = self.greeks.get(trades.instrument)
         mark = self.marks.get(trades.instrument)
         if g is None or not g.HasField("vega") or mark is None:
             return
-        reach = padding(g.vega) // 4
+        out = reach(padding(g.vega))
         for p in trades.prints:
             log.info("PRINT %s %s %d @ %s kind=%s", trades.instrument,
                       SIDE_NAME.get(p.aggressor_side), p.size, to_decimal(p.price), p.kind)
@@ -268,7 +272,7 @@ class Bot:
             if quote is None:
                 continue
             price, size = quote
-            if (side == BUY and price >= p.price - reach) or (side == SELL and price <= p.price + reach):
+            if (side == BUY and price >= p.price - out) or (side == SELL and price <= p.price + out):
                 contracts = min(size, p.size)
                 edge = to_decimal((mark - price) if side == BUY else (price - mark)) * 100 * contracts
                 self.paper_fills += contracts
@@ -462,6 +466,7 @@ class Bot:
         if now - self.last_status > 30:
             self.last_status = now
             self.log_status()
+        self.write_status(now)
         if not self.market_open() or not self.connected or self.resting.incomplete:
             return
         if now - self.last_query > self.cfg.account_query_seconds:
@@ -576,7 +581,42 @@ class Bot:
             await self.send(slot, now, send_amend, instrument=contract, side=side,
                             price=resting.key.price, new_size=size, new_price=price)
 
+    def count_message(self) -> None:
+        now = time.monotonic()
+        self.sent_times.append(now)
+        while self.sent_times and now - self.sent_times[0] > 60:
+            self.sent_times.popleft()
+
+    def write_status(self, now: float) -> None:
+        """A small status file for the dashboard, every couple of seconds."""
+        if now - self.last_status_file < 2:
+            return
+        self.last_status_file = now
+        while self.sent_times and now - self.sent_times[0] > 60:
+            self.sent_times.popleft()
+        status = {
+            "t": time.time(),
+            "strat_id": self.strat_id,
+            "dry_run": self.dry_run,
+            "market_open": self.market_open(),
+            "messages_last_minute": len(self.sent_times),
+            "budget_per_minute": self.cfg.limits.sustained_per_minute,
+            "budget_paused": now < self.paused_until,
+            "paused": sorted(self.paused),
+            "quoting": len(self.quoting),
+            "resting": self.own_count(),
+            "paper_fills": self.paper_fills,
+            "paper_edge": float(self.paper_edge),
+            "daily_pnl": float(self.daily_pnl),
+            "in_cure": self.in_cure,
+        }
+        with contextlib.suppress(OSError):
+            tmp = STATUS.with_suffix(".tmp")
+            tmp.write_text(json.dumps(status))
+            tmp.replace(STATUS)
+
     async def send(self, slot: Slot, now: float, fn, **kwargs) -> None:
+        self.count_message()
         ref = new_request_ref()
         slot.pending, slot.sent_at = ref, now
         try:
@@ -619,6 +659,7 @@ class Bot:
             log.info("HEDGE %s %s %d @ %s", SIDE_NAME[side], underlying, abs(shares),
                      to_decimal(price))
             try:
+                self.count_message()
                 await send_new(self.session, strat_id=self.strat_id, instrument=underlying,
                                side=side, order_type=LIMIT, price=price, size=abs(shares),
                                request_ref=ref)

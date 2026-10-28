@@ -1,11 +1,12 @@
 """Where to rest passive option quotes so that live prints fill them.
 
 The edge (rulebook 2007, 6002): an eligible live print fills a resting student order at
-that order's own limit price, when a bid is at least P - 0.25*delta for a sell print (an
-offer at most P + 0.25*delta for a buy print), where P is the print price and delta the
-per-side padding. Live sell prints happen around the live bid, which is below the official
-mark (the live mid). So a bid at about live_bid - 0.25*delta qualifies for those prints and
-fills below the mark: the gap is edge against the mark, plus the $0.20 maker rebate.
+that order's own limit price, when a bid is at least P - kappa*delta for a sell print (an
+offer at most P + kappa*delta for a buy print), where P is the print price, delta the
+per-side padding and kappa = 0.45 from Revision 4 (28 October 2026; 0.25 before). Live sell
+prints happen around the live bid, which is below the official mark (the live mid). So a
+bid at about live_bid - kappa*delta qualifies for those prints and fills below the mark:
+the gap is edge against the mark, plus the $0.20 maker rebate.
 
 Every price here is an int of micro-dollars. Nothing here uses float.
 """
@@ -14,6 +15,7 @@ from dataclasses import dataclass
 
 CENT = 10_000  # Rule 6002 rounds option padding up to a whole cent
 MIN_PADDING = 2 * CENT  # Rule 6002: padding is at least $0.02 per side
+KAPPA_PCT = 45  # Rule 2007 trade-based eligibility coefficient, in percent (Revision 4)
 
 
 def ceil_to(value: int, step: int) -> int:
@@ -22,6 +24,12 @@ def ceil_to(value: int, step: int) -> int:
 
 def floor_to(value: int, step: int) -> int:
     return (value // step) * step
+
+
+def reach(pad: int) -> int:
+    """How far outside a print price a resting order may sit and still qualify, rounded
+    down so an order placed this far out always qualifies."""
+    return pad * KAPPA_PCT // 100
 
 
 def padding(vega: int) -> int:
@@ -51,20 +59,20 @@ def passive_quotes(
 
     The live quote is inferred from the wall: wall = live -/+ padding, unless the exchange
     widened the band to its minimum width, in which case the live quote is inside it and
-    the mark (live mid) bounds it. Each side sits a quarter padding outside the live quote,
+    the mark (live mid) bounds it. Each side sits kappa paddings outside the live quote,
     the furthest point that still qualifies for live prints, then is clipped so it keeps at
     least `min_edge` against the mark and rests strictly inside the wall."""
     pad = padding(vega)
-    quarter = pad // 4
+    out = reach(pad)
     live_bid = min(wall_bid + pad, mark)
     live_ask = max(wall_ask - pad, mark)
 
-    bid: int | None = ceil_to(live_bid - quarter, tick) + improve_ticks * tick
+    bid: int | None = ceil_to(live_bid - out, tick) + improve_ticks * tick
     bid = min(bid, floor_to(mark - min_edge, tick))
     if bid <= wall_bid or bid < tick:
         bid = None
 
-    ask: int | None = floor_to(live_ask + quarter, tick) - improve_ticks * tick
+    ask: int | None = floor_to(live_ask + out, tick) - improve_ticks * tick
     ask = max(ask, ceil_to(mark + min_edge, tick))
     if ask >= wall_ask:
         ask = None
