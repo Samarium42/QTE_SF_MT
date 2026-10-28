@@ -21,7 +21,9 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import signal
+import subprocess
 import sys
 import time
 from collections import deque
@@ -134,6 +136,8 @@ class Bot:
         self.control_mtime = 0.0
         self.arb_seen: set[tuple[str, str]] = set()
         self.paper_edge = Decimal(0)  # dollars against the mark, before the maker rebate
+        self.last_grid_wall = 0.0  # wall clock of the last grid tick, to spot a stall
+        self.hold_until = 0.0  # no quoting until then, after a stall
 
     # ---------- reading ----------
 
@@ -249,7 +253,10 @@ class Bot:
         if reason in BUDGET_REJECTS:
             log.warning("message budget reject (%s): pausing order messages for a minute", name)
             self.paused_until = time.monotonic() + BUDGET_PAUSE
-        elif reason in (ReasonCodes.MIN_REST_VIOLATION, ReasonCodes.NO_ORDER_AT_LEVEL):
+        elif reason in (ReasonCodes.MIN_REST_VIOLATION, ReasonCodes.NO_ORDER_AT_LEVEL,
+                        ReasonCodes.AMEND_PRICE_AT_OR_BEYOND_WALL):
+            # The wall moved while the amend was in flight: the next tick requotes from the
+            # fresh book, so there is nothing to block.
             log.debug("reject %s on %s %s", name, instrument, SIDE_NAME.get(side))
         else:
             log.warning("reject %s on %s %s", name, instrument, SIDE_NAME.get(side))
@@ -469,6 +476,7 @@ class Bot:
         self.write_status(now)
         if not self.market_open() or not self.connected or self.resting.incomplete:
             return
+        await self.check_stall(now)
         if now - self.last_query > self.cfg.account_query_seconds:
             await self.query_account()
         if not self.account_known:
@@ -480,7 +488,7 @@ class Bot:
             self.quoting = self.choose_contracts()
             if self.quoting:
                 log.info("quoting %d contracts: %s", len(self.quoting), " ".join(self.quoting))
-        if now < self.paused_until:
+        if now < self.paused_until or now < self.hold_until:
             return
 
         self.read_control()
@@ -505,6 +513,22 @@ class Bot:
                 await self.reconcile(contract, side, target, now)
         if not down:
             await self.hedge(exposure, now)
+
+    async def check_stall(self, now: float) -> None:
+        """Dead-man on wake: after a gap in grid ticks (the machine slept, or the link stalled)
+        our quotes were unmanaged, so cancel them all, refresh the account, and hold quoting a
+        moment before quoting again from fresh state."""
+        wall = time.time()
+        gap = wall - self.last_grid_wall if self.last_grid_wall else 0.0
+        self.last_grid_wall = wall
+        if gap < self.cfg.stall_seconds or self.dry_run:
+            return
+        log.warning("no grid ticks for %.0f s (asleep or link stalled): cancelling our quotes, "
+                    "holding %.0f s", gap, self.cfg.stall_hold_seconds)
+        await self.cancel_all()
+        self.hold_until = now + self.cfg.stall_hold_seconds
+        self.account_known = False
+        await self.query_account()
 
     def scan_arbitrage(self) -> None:
         """Log no-arbitrage violations in each underlying's front expiry, priced at the walls
@@ -696,6 +720,20 @@ class Bot:
         )
 
 
+def keep_awake() -> None:
+    """On a Mac, hold off idle and system sleep for as long as this process lives: asleep, the
+    bot cannot manage its quotes but they stay live on the exchange. A closed lid still
+    sleeps, and on battery `caffeinate -s` does not apply, so warn about that."""
+    if sys.platform != "darwin":
+        return
+    with contextlib.suppress(OSError):
+        subprocess.Popen(["caffeinate", "-is", "-w", str(os.getpid())],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        power = subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True).stdout
+        if "Battery Power" in power:
+            log.warning("on battery: plug in, or the Mac may sleep with our quotes live")
+
+
 async def run(args: argparse.Namespace) -> int:
     cfg = Settings()
     lim = cfg.limits
@@ -703,6 +741,8 @@ async def run(args: argparse.Namespace) -> int:
                          burst_per_second=lim.burst_per_second))
     session = ReconnectingSession(pacing=pacer)
     bot = Bot(session, args.strat_id, cfg, args.dry_run)
+    if not args.dry_run:
+        keep_awake()
 
     loop = asyncio.get_running_loop()
     task = asyncio.current_task()

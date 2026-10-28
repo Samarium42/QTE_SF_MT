@@ -34,10 +34,10 @@ class Settings:
 
     # Which contracts: per underlying, the nearest strikes to the forward in the nearest
     # expiry open to new positions, calls and puts both.
-    strikes_per_underlying: int = 6
+    strikes_per_underlying: int = 8
     # Contracts per quote, and the most the bot will hold long or short in one contract.
-    quote_size: int = 5
-    max_position: int = 20
+    quote_size: int = 10
+    max_position: int = 40
 
     # Least edge, in dollars per share, a quote must keep against the mark.
     min_edge: Decimal = Decimal("0.01")
@@ -55,7 +55,7 @@ class Settings:
     hedge_threshold: Decimal = Decimal("100_000")  # dollars of unhedged delta
     hedge_cooldown_seconds: float = 5.0
     # Delta left unhedged, in fills of quote_size at this delta: keeps stock qualifying (Rule 6006).
-    hedge_buffer_fills: int = 2
+    hedge_buffer_fills: int = 1
     hedge_buffer_delta: Decimal = Decimal("0.6")
 
     # Stop quoting this long before the session's close.
@@ -66,3 +66,7 @@ class Settings:
 
     # Ask the exchange for the account this often.
     account_query_seconds: float = 5.0
+    # Dead-man on wake: a gap this long between grid ticks cancels our quotes, then the bot
+    # holds this long before quoting again.
+    stall_seconds: float = 10.0
+    stall_hold_seconds: float = 5.0
