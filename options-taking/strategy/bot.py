@@ -97,8 +97,10 @@ class Slot:
 
 
 class Bot:
-    def __init__(self, session: ReconnectingSession, strat_id: str, cfg: Settings, dry_run: bool):
+    def __init__(self, session: ReconnectingSession, strat_id: str, cfg: Settings, dry_run: bool,
+                 hedging: bool = True):
         self.session = session
+        self.hedging = hedging  # False when strategy/hedger.py hedges the book instead
         self.strat_id = strat_id
         self.cfg = cfg
         self.dry_run = dry_run
@@ -511,7 +513,7 @@ class Bot:
         for (contract, side), target in wanted.items():
             if is_option_symbol(contract):
                 await self.reconcile(contract, side, target, now)
-        if not down:
+        if not down and self.hedging:
             await self.hedge(exposure, now)
 
     async def check_stall(self, now: float) -> None:
@@ -633,6 +635,7 @@ class Bot:
             "paper_edge": float(self.paper_edge),
             "daily_pnl": float(self.daily_pnl),
             "in_cure": self.in_cure,
+            "hedging": self.hedging,
         }
         with contextlib.suppress(OSError):
             tmp = STATUS.with_suffix(".tmp")
@@ -740,7 +743,7 @@ async def run(args: argparse.Namespace) -> int:
     pacer = Pacer(Budget(sustained_per_minute=lim.sustained_per_minute,
                          burst_per_second=lim.burst_per_second))
     session = ReconnectingSession(pacing=pacer)
-    bot = Bot(session, args.strat_id, cfg, args.dry_run)
+    bot = Bot(session, args.strat_id, cfg, args.dry_run, hedging=not args.no_hedge)
     if not args.dry_run:
         keep_awake()
 
@@ -791,6 +794,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--strat-id", required=True, help="strategy ID registered for the team")
     parser.add_argument("--dry-run", action="store_true",
                         help="read the market and log what it would send; send nothing")
+    parser.add_argument("--no-hedge", action="store_true",
+                        help="leave delta hedging to strategy/hedger.py")
     parser.add_argument("--seconds", type=float, default=None,
                         help="stop after this long (default: run until Ctrl+C)")
     args = parser.parse_args(argv)

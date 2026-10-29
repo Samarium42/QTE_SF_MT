@@ -324,6 +324,13 @@ input[type=number] { width: 84px; }
     </div>
   </section>
   <section>
+    <h2>Delta hedger <span class="q" title="A separate process (strategy/hedger.py, its own strat_id) that hedges the option delta of the whole team book in SPY and GOOGL stock, whichever strategy made it. Run the quoter with --no-hedge so nothing is hedged twice. From logs/hedger-status.json.">?</span></h2>
+    <p class="sub">Option delta, hedge stock and what is left, per underlying.</p>
+    <div id="hedgerBox"></div>
+    <div class="scroll"><table id="hedgerTable"></table></div>
+    <div class="scroll"><table id="hedgerRecent"></table></div>
+  </section>
+  <section>
     <h2>Stale-quote picker <span class="q" title="A separate strategy (strategy/stale_bot.py, its own strat_id). It crosses other teams' option quotes that sit on the wrong side of the wall mid by more than the taker fee plus min_edge, then cancels what is left. From logs/stale-status.json.">?</span></h2>
     <p class="sub">Takes found and sent, fills, and edge against the wall mid at the fill.</p>
     <div id="staleBox"></div>
@@ -440,6 +447,10 @@ function banner(s, a) {
   if (s.session && s.session.open && (!bot || bot.age > 30)) add("warn", "The market is open but the <b>bot is not running</b>. See <a href=\"#bot\">Bot &amp; controls</a>.");
   if (bot && bot.age <= 30 && bot.dry_run) add("warn", "The bot is in <b>dry run</b>: it is watching, not trading.");
   if (bot && bot.budget_paused) add("warn", "The bot hit the <b>message budget</b> and is paused for a minute.");
+  const hg = a && a.hedger, hedgerUp = hg && hg.age <= 30 && !hg.dry_run;
+  const quoterHedges = bot && bot.age <= 30 && !bot.dry_run && bot.hedging !== false;
+  if (s.session && s.session.open && !hedgerUp && !quoterHedges) add("crit", "<b>Nothing is delta hedging the book.</b> Start the hedger live, or the quoter without --no-hedge. See <a href=\"#bot\">Bot &amp; controls</a>.");
+  if (hg && hg.age <= 30 && hg.quoter_hedging) add("warn", "The quoter and the hedger are both set to hedge: restart the quoter with <b>--no-hedge</b>.");
   if (s.paused.length) add("warn", "Quoting is <b>paused</b> on " + s.paused.map(esc).join(", ") + ".");
   if (a) for (const e of a.expiries) if (e.contracts_held && e.dte <= 7)
     add(e.dte <= 4 ? "crit" : "warn", `${esc(e.underlying)} ${e.expiry}: ${e.contracts_held} contracts held, ${e.dte} days to expiry. Roll before it is closed at official marks.`);
@@ -599,6 +610,21 @@ function renderAnalytics(a) {
       ${b.dry_run ? `<dt>Paper fills</dt><dd>${fmt(b.paper_fills)} contracts · ${usd(b.paper_edge)} edge vs mark</dd>` : ""}
     </dl>`;
   }
+  // delta hedger
+  const hg = a.hedger, hgUp = hg && hg.age <= 30;
+  if (!hg) $("hedgerBox").innerHTML = '<div class="empty">Not run yet. Start it with <code>python -m strategy.hedger --strat-id &lt;ID&gt; --dry-run</code>, and the quoter with <code>--no-hedge</code>.</div>';
+  else $("hedgerBox").innerHTML = `<dl class="kv">
+      <dt>State</dt><dd><span class="dot ${hgUp ? (hg.dry_run ? "warning" : "good") : "critical"}"></span> ${hgUp ? (hg.dry_run ? "running, dry run (sends nothing)" : "running, live") : "not running (last seen " + ago(hg.age) + "): <b>nothing is hedging the book</b> unless the quoter runs without --no-hedge"}${hgUp && !hg.trading ? " · not hedging now (closed, last minute, or reconciling)" : ""}</dd>
+      ${hg.quoter_hedging ? '<dt>Warning</dt><dd><span class="neg">The quoter is live and hedging too, so the hedger is sending nothing. Restart the quoter with <code>--no-hedge</code>.</span></dd>' : ""}
+      <dt>Strategy ID</dt><dd>${esc(hg.strat_id)}</dd>
+      <dt>Hedges</dt><dd>${fmt(hg.hedges)} sent · ${fmt(hg.shares_filled)} shares filled · hedges past ${usd(hg.threshold)} of delta</dd>
+    </dl>`;
+  table("hedgerTable", [["Underlying"], ["Option delta", 1], ["Stock", 1, "Shares held as hedge"], ["Stock $", 1], ["Net delta", 1], ["Next hedge", 1, "Shares the hedger wants to trade now; 0 inside the threshold or buffer"]],
+    hg ? Object.entries(hg.underlyings || {}).map(([u, v]) => [esc(u), v.option_delta == null ? "no Greeks" : compact(v.option_delta), fmt(v.stock_shares), compact(v.stock_notional), compact(v.net_delta), v.want ? (v.want > 0 ? "buy " : "sell ") + fmt(Math.abs(v.want)) : "0"]) : [],
+    "No underlyings yet.");
+  table("hedgerRecent", [["Time"], ["Hedge"], ["Size", 1], ["At", 1], ["Option delta", 1]],
+    hg ? (hg.recent || []).map((r) => [hhmm(r.t), `<span class="chip ${r.side === "BUY" ? "buy" : "sell"}">${r.side}</span> ${esc(r.underlying)}`, fmt(r.size), fmt(r.price, 2), compact(r.option_delta)]) : [],
+    "No hedges yet.");
   // stale-quote picker
   const st = a.stale;
   if (!st) $("staleBox").innerHTML = '<div class="empty">Not run yet. Start it with <code>python -m strategy.stale_bot --strat-id &lt;ID&gt; --dry-run</code>.</div>';

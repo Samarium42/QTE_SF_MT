@@ -611,6 +611,7 @@ class Hub:
             "expiries": self.expiry_view(),
             "bot": self.bot_file(),
             "stale": self.bot_file("stale-status.json"),
+            "hedger": self.bot_file("hedger-status.json"),
         }
 
     def sharpe_view(self) -> dict:

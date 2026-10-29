@@ -91,7 +91,36 @@ class StaleSettings:
     # book has not caught up) is not hit twice.
     cooldown_seconds: float = 1.0
     # Messages: the team's 2,400 per minute is shared. The SDK pacer keeps each process at
-    # 80% of its own budget: quoter 1,920 + dashboard 192 + this 240 = 2,352 per minute.
-    sustained_per_minute: int = 300
+    # 80% of its own budget: quoter 1,920 + dashboard 192 + this 200 + hedger 80 = 2,392.
+    sustained_per_minute: int = 250
     burst_per_second: int = 100
     account_query_seconds: float = 30.0
+
+
+@dataclass(frozen=True)
+class HedgerSettings:
+    """The team-wide delta hedger (strategy/hedger.py). It hedges the option delta of the
+    whole book, whichever strategy's fills made it. Run the quoter with --no-hedge."""
+
+    limits: ExchangeLimits = ExchangeLimits()
+    # Unhedged dollar delta per underlying before a hedge.
+    threshold: Decimal = Decimal("100_000")
+    # Delta left unhedged, as one fill of this many contracts at this delta, so a fill that
+    # lands between two hedges cannot take option delta through zero against the stock.
+    buffer_contracts: int = 10
+    buffer_delta: Decimal = Decimal("0.6")
+    # The qualifying band per underlying is |H| <= |D| + tolerance. Rule 6006 allows $100k
+    # per underlying but only $150k summed over both, so $75k each keeps both tests.
+    tolerance: Decimal = Decimal("75_000")
+    # Walk the stock wall's ladder at most this far past the touch, in basis points.
+    max_slippage_bp: Decimal = Decimal("3")
+    # Least seconds between two hedges in one underlying, and how long an unanswered
+    # hedge blocks the next.
+    min_interval_seconds: float = 0.5
+    pending_timeout_seconds: float = 2.0
+    # Stop sending this long before the close (the close cancels everything anyway).
+    stop_before_close_seconds: int = 60
+    # Messages: a small slice of the team's 2,400 per minute (see StaleSettings for the sum).
+    sustained_per_minute: int = 100
+    burst_per_second: int = 20
+    account_query_seconds: float = 5.0
