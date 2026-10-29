@@ -305,6 +305,11 @@ input[type=number] { width: 84px; }
 
 <!-- ================= BOT ================= -->
 <div class="page" id="page-bot">
+  <section>
+    <h2>Strategies <span class="q" title="Start each bot here instead of in a terminal. Dry run watches and logs but sends nothing. Stop asks the bot to shut down as Ctrl+C does, cancelling its own orders; if it is still running after 15 s, a bot started here is killed and its orders are cancelled from the dashboard. Bots started here stop when the dashboard is closed.">?</span></h2>
+    <p class="sub">Start, stop and see the mode of each bot. Live start asks to confirm.</p>
+    <div class="scroll"><table id="botsTable"></table></div>
+  </section>
   <section class="w5">
     <h2>Bot status</h2>
     <p class="sub">From <code>logs/bot-status.json</code>, written every 2 s.</p>
@@ -317,8 +322,8 @@ input[type=number] { width: 84px; }
     <div class="help">
       <b>Running the bot</b>
       <ul>
-        <li>Watch only (sends nothing): <code>python -m strategy.bot --strat-id &lt;ID&gt; --dry-run</code></li>
-        <li>Live: <code>python -m strategy.bot --strat-id &lt;ID&gt;</code>. Ctrl+C cancels its quotes and exits.</li>
+        <li>Easiest: the <b>Strategies</b> panel above starts and stops each bot.</li>
+        <li>From a terminal: <code>python -m strategy.bot --strat-id &lt;ID&gt; --dry-run</code> (or without <code>--dry-run</code> for live). Ctrl+C cancels its quotes and exits; the Stop button works on it too.</li>
         <li>The strategy ID must be registered by the Team Lead with SPY and GOOGL options and stock in scope.</li>
       </ul>
     </div>
@@ -433,6 +438,7 @@ function niceTicks(lo, hi, n) {
 }
 
 let S = null, A = null;
+let noHedgePick = null;  // the quoter's "leave hedging to the hedger" box, once someone ticks it
 
 // ---------- banner: what needs attention ----------
 function banner(s, a) {
@@ -486,6 +492,7 @@ function render(s) {
   const sh = A && A.sharpe;
   const kpis = [
     ["Equity", a ? compact(a.equity) : "—", a ? `cash ${compact(a.cash)}` : "waiting for the account", "Cash plus positions at the official mark."],
+    ["Total P&L", a ? signed(a.equity - a.starting_equity) : "—", a ? `since the term's ${compact(a.starting_equity)} start` : "", "Equity minus the term's starting $2.5M: the net P&L that is 30% of the score (Rule 9002)."],
     ["Today's P&L", a ? signed(a.daily_pnl) : "—", a ? `halt at −${compact(a.loss_halt)}` : "", "Equity minus last official close, financing included.",
       a ? meter(dayFrac, a.loss_warning / a.loss_halt, dayFrac >= 1 ? "critical" : dayFrac * a.loss_halt >= a.loss_warning ? "serious" : "") : ""],
     ["Sharpe (score)", sh && sh.days ? fmt(sh.sharpe, 2) : "—", sh ? `${sh.days} day${sh.days === 1 ? "" : "s"} recorded` : "", "70% of the score. Needs at least two days."],
@@ -533,6 +540,22 @@ function render(s) {
     .sort((x, y) => y.t - x.t).slice(0, 150);
   feed("rejects", ev, (x) => `<li><time>${hhmm(x.t)}</time><span class="dot ${x.cls}"></span><span>${esc(x.text)}</span></li>`, "Nothing yet.");
   feed("botEvents", s.bot.events, (e) => `<li><time>${hhmm(e.t)}</time><span class="dot ${e.level === "WARNING" || e.level === "ERROR" ? "serious" : ""}"></span><span>${esc(e.text)}</span></li>`, "No bot log lines yet.");
+
+  // strategies: start / stop
+  const hedgerLive = s.bots.some((b) => b.name === "hedger" && b.running && b.dry_run === false);
+  table("botsTable", [["Strategy"], ["ID"], ["State"], ["Mode"], ["Start / stop"]],
+    s.bots.map((b) => {
+      const state = b.stopping ? '<span class="dot warning"></span> stopping…'
+        : b.running ? `<span class="dot ${b.dry_run === false ? "good" : "warning"}"></span> running${b.owned ? "" : " (from a terminal)"}`
+        : `<span class="dot"></span> off${b.exit_code != null && b.exit_code !== 0 ? ` <span class="neg">(last exit code ${b.exit_code}: see logs/${esc(b.name)}-console.log)</span>` : ""}`;
+      const mode = !b.running ? "—" : b.dry_run === null ? "starting…" : (b.dry_run ? "dry run" : "<b>live</b>")
+        + (b.name === "quoter" && b.hedging === false ? " · no hedge" : "");
+      const hedge = b.name === "quoter" ? `<label class="muted" style="margin-right:8px" title="--no-hedge: leave delta hedging to the hedger"><input type="checkbox" data-nohedge ${(noHedgePick ?? hedgerLive) ? "checked" : ""}> leave hedging to the hedger</label>` : "";
+      const buttons = b.running
+        ? `<button class="danger" data-act="stop" data-name="${esc(b.name)}" ${b.stopping ? "disabled" : ""}>■ Stop</button>`
+        : `${hedge}<button data-act="dry" data-name="${esc(b.name)}">▶ Dry run</button> <button class="primary" data-act="live" data-name="${esc(b.name)}">▶ Live</button>`;
+      return [esc(b.label), `<code>${esc(b.strat_id)}</code>`, state, mode, buttons];
+    }), "No strategies configured.");
 
   // controls
   const paused = new Set(s.paused);
@@ -617,9 +640,9 @@ function renderAnalytics(a) {
       <dt>State</dt><dd><span class="dot ${hgUp ? (hg.dry_run ? "warning" : "good") : "critical"}"></span> ${hgUp ? (hg.dry_run ? "running, dry run (sends nothing)" : "running, live") : "not running (last seen " + ago(hg.age) + "): <b>nothing is hedging the book</b> unless the quoter runs without --no-hedge"}${hgUp && !hg.trading ? " · not hedging now (closed, last minute, or reconciling)" : ""}</dd>
       ${hg.quoter_hedging ? '<dt>Warning</dt><dd><span class="neg">The quoter is live and hedging too, so the hedger is sending nothing. Restart the quoter with <code>--no-hedge</code>.</span></dd>' : ""}
       <dt>Strategy ID</dt><dd>${esc(hg.strat_id)}</dd>
-      <dt>Hedges</dt><dd>${fmt(hg.hedges)} sent · ${fmt(hg.shares_filled)} shares filled · hedges past ${usd(hg.threshold)} of delta</dd>
+      <dt>Hedges</dt><dd>${fmt(hg.hedges)} sent · ${fmt(hg.shares_filled)} shares filled · hedges when net delta passes ${compact(hg.trigger)}, back down to ${compact(hg.target)}</dd>
     </dl>`;
-  table("hedgerTable", [["Underlying"], ["Option delta", 1], ["Stock", 1, "Shares held as hedge"], ["Stock $", 1], ["Net delta", 1], ["Next hedge", 1, "Shares the hedger wants to trade now; 0 inside the threshold or buffer"]],
+  table("hedgerTable", [["Underlying"], ["Option delta", 1], ["Stock", 1, "Shares held as hedge"], ["Stock $", 1], ["Net delta", 1], ["Next hedge", 1, "Shares the hedger wants to trade now; 0 while net delta is under the trigger"]],
     hg ? Object.entries(hg.underlyings || {}).map(([u, v]) => [esc(u), v.option_delta == null ? "no Greeks" : compact(v.option_delta), fmt(v.stock_shares), compact(v.stock_notional), compact(v.net_delta), v.want ? (v.want > 0 ? "buy " : "sell ") + fmt(Math.abs(v.want)) : "0"]) : [],
     "No underlyings yet.");
   table("hedgerRecent", [["Time"], ["Hedge"], ["Size", 1], ["At", 1], ["Option delta", 1]],
@@ -794,6 +817,25 @@ form.structure.onchange = strikeInputs;
 $("pauses").onclick = async (e) => {
   const b = e.target.closest("button"); if (!b) return;
   await post("/api/control", {underlying: b.dataset.u, paused: b.dataset.p === "1"});
+  tick();
+};
+$("botsTable").onchange = (e) => { if (e.target.matches("[data-nohedge]")) noHedgePick = e.target.checked; };
+$("botsTable").onclick = async (e) => {
+  const b = e.target.closest("button[data-act]"); if (!b) return;
+  const name = b.dataset.name, act = b.dataset.act, row = b.closest("tr");
+  const label = row ? row.cells[0].textContent : name;
+  let res;
+  if (act === "stop") {
+    if (!confirm(`Stop the ${label}?\n\nIt cancels its own orders and exits.`)) return;
+    res = await post("/api/bots/stop", {name});
+  } else {
+    const live = act === "live";
+    const noHedge = !!(row && row.querySelector("[data-nohedge]:checked"));
+    if (live && !confirm(`Start the ${label} LIVE?\n\nIt will send real orders under its strategy ID.` +
+        (name === "quoter" && noHedge ? "\n\nIt will NOT hedge: make sure the hedger is running live." : ""))) return;
+    res = await post("/api/bots/start", {name, live, confirm: live, no_hedge: noHedge});
+  }
+  if (res && res.error) alert(res.error);
   tick();
 };
 $("cancelAll").onclick = async () => {

@@ -64,6 +64,7 @@ log = logging.getLogger("sf_hedger")
 
 STATUS = Path("logs/hedger-status.json")  # read by the dashboard
 QUOTER_STATUS = Path("logs/bot-status.json")
+CONTROL = Path("control.json")  # written by the dashboard: {"stop": {"hedger": time}}
 BUDGET_REJECTS = frozenset({ReasonCodes.MESSAGE_BUDGET_EXCEEDED, ReasonCodes.BURST_CAP_EXCEEDED})
 SIDE_NAME = {BUY: "BUY", SELL: "SELL"}
 
@@ -263,12 +264,14 @@ class Hedger:
         view["net_delta"] = float(delta + shares_held * spot_d)
 
         lim = self.cfg.limits
+        # hedge_shares trades once |options + stock| passes `threshold`, and then hedges
+        # only the option delta beyond `buffer`, which leaves net delta at the target.
         shares = hedge_shares(
             delta, shares_held, spot_d,
-            threshold=self.cfg.threshold,
+            threshold=lim.net_delta_per_underlying * self.cfg.trigger_fraction,
             max_order=lim.max_hedge_order,
             tolerance=self.cfg.tolerance,
-            buffer=self.cfg.buffer_contracts * MULTIPLIER * self.cfg.buffer_delta * spot_d,
+            buffer=lim.net_delta_per_underlying * self.cfg.target_fraction,
         )
         view["want"] = shares
         if shares == 0 or not self.trading() or now < self.paused_until:
@@ -354,7 +357,8 @@ class Hedger:
             "budget_paused": now < self.paused_until,
             "hedges": self.hedges, "shares_filled": self.shares_filled,
             "underlyings": self.view, "recent": list(self.recent),
-            "threshold": float(self.cfg.threshold),
+            "trigger": float(self.cfg.limits.net_delta_per_underlying * self.cfg.trigger_fraction),
+            "target": float(self.cfg.limits.net_delta_per_underlying * self.cfg.target_fraction),
         }
         with contextlib.suppress(OSError):
             tmp = STATUS.with_suffix(".tmp")
@@ -376,17 +380,40 @@ async def run(args: argparse.Namespace) -> int:
         loop.add_signal_handler(signal.SIGINT, task.cancel)
         loop.add_signal_handler(signal.SIGTERM, task.cancel)
 
+    # Stop from the dashboard: it writes {"stop": {"hedger": time}} to control.json, and a
+    # request newer than this start shuts down as Ctrl+C does, cancelling our orders first.
+    started = time.time()
+
+    async def watch_stop() -> None:
+        while True:
+            await asyncio.sleep(0.5)
+            with contextlib.suppress(OSError, ValueError, AttributeError, TypeError):
+                if json.loads(CONTROL.read_text()).get("stop", {}).get("hedger", 0) > started:
+                    log.info("stop requested from the dashboard")
+                    task.cancel()
+                    return
+
+    # A ReconnectingSession can be iterated only once, so a pump task owns it (as in bot.py).
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def pump() -> None:
+        async for event in session:
+            await queue.put(event)
+
     async with session:
+        pumping = asyncio.create_task(pump())
+        watching = asyncio.create_task(watch_stop())
         try:
             async with asyncio.timeout(args.seconds):
-                async for event in session:
-                    await hedger.on_event(event)
+                while True:
+                    await hedger.on_event(await queue.get())
         except TimeoutError:
             log.info("time is up")
         except asyncio.CancelledError:
             log.info("interrupted: stopping (Ctrl+C again to quit)")
             task.uncancel()
         hedger.stopping = True
+        watching.cancel()
         log.info("hedges sent %d, %d shares filled", hedger.hedges, hedger.shares_filled)
         if not args.dry_run and hedger.own_count():
             # Hedges never rest, but a remainder caught mid-cancel could: clear it.
@@ -395,6 +422,11 @@ async def run(args: argparse.Namespace) -> int:
                     with contextlib.suppress(Exception):
                         await send_cancel(session, instrument=order.key.instrument,
                                           side=order.key.side, price=order.key.price)
+            with contextlib.suppress(TimeoutError):
+                async with asyncio.timeout(3):
+                    while hedger.own_count():
+                        await hedger.on_event(await queue.get())
+        pumping.cancel()
     log.info("stopped. Nothing hedges the book now unless the quoter runs without --no-hedge.")
     return 0
 

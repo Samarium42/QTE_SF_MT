@@ -103,12 +103,12 @@ class HedgerSettings:
     whole book, whichever strategy's fills made it. Run the quoter with --no-hedge."""
 
     limits: ExchangeLimits = ExchangeLimits()
-    # Unhedged dollar delta per underlying before a hedge.
-    threshold: Decimal = Decimal("100_000")
-    # Delta left unhedged, as one fill of this many contracts at this delta, so a fill that
-    # lands between two hedges cannot take option delta through zero against the stock.
-    buffer_contracts: int = 10
-    buffer_delta: Decimal = Decimal("0.6")
+    # Hedge an underlying once its net delta (options plus stock) passes trigger_fraction
+    # of the exchange's per-underlying delta limit ($1.5M), and hedge it back down to
+    # target_fraction of that limit, not to zero. What is left unhedged is room for fills
+    # to land without taking option delta through zero against the stock (Rule 6006).
+    trigger_fraction: Decimal = Decimal("0.25")  # $375k
+    target_fraction: Decimal = Decimal("0.15")  # $225k
     # The qualifying band per underlying is |H| <= |D| + tolerance. Rule 6006 allows $100k
     # per underlying but only $150k summed over both, so $75k each keeps both tests.
     tolerance: Decimal = Decimal("75_000")

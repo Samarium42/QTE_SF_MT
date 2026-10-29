@@ -754,6 +754,19 @@ async def run(args: argparse.Namespace) -> int:
         loop.add_signal_handler(signal.SIGINT, task.cancel)
         loop.add_signal_handler(signal.SIGTERM, task.cancel)
 
+    # Stop from the dashboard: it writes {"stop": {"quoter": time}} to control.json, and a
+    # request newer than this start shuts down as Ctrl+C does, cancelling our orders first.
+    started = time.time()
+
+    async def watch_stop() -> None:
+        while True:
+            await asyncio.sleep(0.5)
+            with contextlib.suppress(OSError, ValueError, AttributeError, TypeError):
+                if json.loads(CONTROL.read_text()).get("stop", {}).get("quoter", 0) > started:
+                    log.info("stop requested from the dashboard")
+                    task.cancel()
+                    return
+
     # A ReconnectingSession can be iterated only once, and cancelling the loop that iterates
     # it ends the iteration; so a pump task owns it and the shutdown keeps reading the queue.
     queue: asyncio.Queue = asyncio.Queue()
@@ -764,6 +777,7 @@ async def run(args: argparse.Namespace) -> int:
 
     async with session:
         pumping = asyncio.create_task(pump())
+        watching = asyncio.create_task(watch_stop())
         try:
             async with asyncio.timeout(args.seconds):
                 while True:
@@ -774,6 +788,7 @@ async def run(args: argparse.Namespace) -> int:
             log.info("interrupted: cancelling this strategy's quotes (Ctrl+C again to quit)")
             task.uncancel()
         bot.stopping = True
+        watching.cancel()
         if not args.dry_run:
             await bot.cancel_all()
             with contextlib.suppress(TimeoutError):

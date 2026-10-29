@@ -68,6 +68,7 @@ from strategy.stale import find_takes
 log = logging.getLogger("sf_stale")
 
 STATUS = Path("logs/stale-status.json")  # read by the dashboard
+CONTROL = Path("control.json")  # written by the dashboard: {"stop": {"picker": time}}
 BUDGET_REJECTS = frozenset({ReasonCodes.MESSAGE_BUDGET_EXCEEDED, ReasonCodes.BURST_CAP_EXCEEDED})
 SIDE_NAME = {BUY: "BUY", SELL: "SELL"}
 STOP_BEFORE_CLOSE_MS = 10 * 60 * 1000
@@ -382,17 +383,41 @@ async def run(args: argparse.Namespace) -> int:
         loop.add_signal_handler(signal.SIGINT, task.cancel)
         loop.add_signal_handler(signal.SIGTERM, task.cancel)
 
+    # Stop from the dashboard: it writes {"stop": {"picker": time}} to control.json, and a
+    # request newer than this start shuts down as Ctrl+C does, cancelling our orders first.
+    started = time.time()
+
+    async def watch_stop() -> None:
+        while True:
+            await asyncio.sleep(0.5)
+            with contextlib.suppress(OSError, ValueError, AttributeError, TypeError):
+                if json.loads(CONTROL.read_text()).get("stop", {}).get("picker", 0) > started:
+                    log.info("stop requested from the dashboard")
+                    task.cancel()
+                    return
+
+    # A ReconnectingSession can be iterated only once, so a pump task owns it and the
+    # shutdown keeps reading the queue (as in strategy/bot.py).
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def pump() -> None:
+        async for event in session:
+            await queue.put(event)
+
     async with session:
+        pumping = asyncio.create_task(pump())
+        watching = asyncio.create_task(watch_stop())
         try:
             async with asyncio.timeout(args.seconds):
-                async for event in session:
-                    await picker.on_event(event)
+                while True:
+                    await picker.on_event(await queue.get())
         except TimeoutError:
             log.info("time is up")
         except asyncio.CancelledError:
             log.info("interrupted: cancelling this strategy's orders (Ctrl+C again to quit)")
             task.uncancel()
         picker.stopping = True
+        watching.cancel()
         log.info("takes found %d, sent %d, filled %d contracts, edge vs wall mid $%s",
                  picker.seen, picker.sent, picker.filled, picker.fill_edge)
         if not args.dry_run:
@@ -403,13 +428,12 @@ async def run(args: argparse.Namespace) -> int:
                                           side=order.key.side, price=order.key.price)
             with contextlib.suppress(TimeoutError):
                 async with asyncio.timeout(5):
-                    async for event in session:
-                        await picker.on_event(event)
-                        if picker.own_count() == 0:
-                            break
-            if picker.own_count():
-                log.error("%d orders may still rest: check the console and cancel them", picker.own_count())
-                return 1
+                    while picker.own_count():
+                        await picker.on_event(await queue.get())
+        pumping.cancel()
+        if not args.dry_run and picker.own_count():
+            log.error("%d orders may still rest: check the console and cancel them", picker.own_count())
+            return 1
     log.info("stopped cleanly")
     return 0
 

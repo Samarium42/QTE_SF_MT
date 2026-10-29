@@ -9,6 +9,13 @@ where .env holds QTE_URL and QTE_TOKEN:
 
 then open http://127.0.0.1:8050. The page is served on localhost only.
 
+Strategies: the page can start each bot (quoter, picker, hedger) as a background process
+and stop it. Stop writes {"stop": {name: time}} to control.json; the bot sees it within a
+second and shuts down as on Ctrl+C, cancelling its own orders. Only if it is still running
+15 s later is the process killed, and then its strategy's resting orders are cancelled
+from here. Stop works for a bot started in a terminal too; closing the dashboard stops
+the bots it started.
+
 Controls: pausing an underlying writes control.json, which the bot reads each grid step
 and then quotes nothing on that underlying (it still hedges). "Cancel all" sends one mass
 cancel, which removes every resting order of the team, every strategy, on every
@@ -21,6 +28,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import sys
 import time
 from collections import deque
 from datetime import date, datetime, timezone
@@ -111,6 +119,16 @@ EQUITY_EVERY = 30.0
 LEG_WAIT = 2.0  # seconds to wait for a leg's fills before giving up on its remainder
 STARTING_EQUITY = 2_500_000.0  # E0: the term's reset opening equity (Rule 9001)
 SOFR = 0.043  # approximate; only sets the idle-cash benchmark the Sharpe subtracts
+# The strategy bots the page can start and stop: module, registered strat_id, status file.
+BOTS = {
+    "quoter": {"label": "Print-capture quoter", "module": "strategy.bot",
+               "strat_id": "sf_print_capture_v1", "status": "bot-status.json"},
+    "picker": {"label": "Stale-quote picker", "module": "strategy.stale_bot",
+               "strat_id": "sf_stale_picker_v1", "status": "stale-status.json"},
+    "hedger": {"label": "Delta hedger", "module": "strategy.hedger",
+               "strat_id": "sf_delta_hedger_v1", "status": "hedger-status.json"},
+}
+STOP_GRACE = 15.0  # seconds a bot gets to stop itself before its process is killed
 SPOT_MOVES = [-0.05, -0.02, -0.01, 0.0, 0.01, 0.02, 0.05]
 VOL_MOVES = [-5.0, -2.0, 0.0, 2.0, 5.0]
 
@@ -177,6 +195,8 @@ class Hub:
         self.underlyings: list[str] = []
 
         self.alerts: deque[dict] = deque(maxlen=200)
+        self.procs: dict[str, asyncio.subprocess.Process] = {}  # bots started from the page
+        self.stopping: dict[str, float] = {}  # bot -> when a stop was asked for
         self.fills: deque[dict] = deque(maxlen=2000)
         self.fill_ids: set[str] = set()
         self.rejects: deque[dict] = deque(maxlen=200)
@@ -476,6 +496,7 @@ class Hub:
             },
             "account": None if s is None else {
                 "equity": d(s.equity), "cash": d(s.cash), "daily_pnl": d(s.daily_pnl),
+                "starting_equity": STARTING_EQUITY,
                 "previous_close_equity": d(s.previous_close_equity),
                 "loss_warning": d(s.loss_warning_amount) if s.HasField("loss_warning_amount") else None,
                 "loss_halt": d(s.loss_halt_amount) if s.HasField("loss_halt_amount") else None,
@@ -508,6 +529,7 @@ class Hub:
                       "alive": time.time() - self.bot_last_line < 90}
         out["equity"] = self.equity[-2000:]
         out["paused"] = read_control().get("paused", [])
+        out["bots"] = self.bots_view()
         out["underlyings"] = self.underlyings
         out["jobs"] = list(self.jobs)
         out["expiries"] = self.expiries()
@@ -844,6 +866,109 @@ class Hub:
                 return False
         return True
 
+    # ---------- starting and stopping the bots ----------
+
+    def bots_view(self) -> list[dict]:
+        out = []
+        for name, bot in BOTS.items():
+            status = self.bot_file(bot["status"])
+            proc = self.procs.get(name)
+            owned = proc is not None and proc.returncode is None
+            fresh = status is not None and status["age"] <= 10
+            out.append({
+                "name": name, "label": bot["label"], "strat_id": bot["strat_id"],
+                "running": owned or fresh, "owned": owned,
+                "pid": proc.pid if proc is not None else None,
+                "exit_code": proc.returncode if proc is not None else None,
+                "dry_run": status.get("dry_run") if fresh else None,
+                "hedging": status.get("hedging") if fresh else None,
+                "stopping": name in self.stopping,
+            })
+        return out
+
+    async def start_bot(self, name: str, live: bool, no_hedge: bool) -> dict:
+        bot = BOTS[name]
+        if any(b["running"] for b in self.bots_view() if b["name"] == name):
+            return {"error": f"{bot['label']} is already running"}
+        args = [sys.executable, "-m", bot["module"], "--strat-id", bot["strat_id"]]
+        if not live:
+            args.append("--dry-run")
+        if name == "quoter" and no_hedge:
+            args.append("--no-hedge")
+        LOGS.mkdir(exist_ok=True)
+        # The bot writes its own log file; a crash's traceback lands here.
+        with open(LOGS / f"{name}-console.log", "ab") as console:
+            self.procs[name] = await asyncio.create_subprocess_exec(
+                *args, cwd=ROOT, stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL, stderr=console)
+        self.stopping.pop(name, None)
+        what = f"{bot['label']} {'LIVE' if live else 'dry run'}" + (" (no hedge)" if "--no-hedge" in args else "")
+        self.alert("serious" if live else "warning", f"started {what} as {bot['strat_id']}")
+        log.info("started %s: %s", name, " ".join(args[1:]))
+        return {"ok": True}
+
+    async def stop_bot(self, name: str) -> dict:
+        data = read_control()
+        stops = data.get("stop") if isinstance(data.get("stop"), dict) else {}
+        stops[name] = time.time()
+        data["stop"] = stops
+        write_control(data)
+        self.stopping[name] = time.time()
+        self.alert("warning", f"asked {BOTS[name]['label']} to stop")
+        asyncio.create_task(self.make_sure_stopped(name))
+        return {"ok": True}
+
+    async def make_sure_stopped(self, name: str) -> None:
+        """Wait for a bot to stop itself; past STOP_GRACE, kill a process the page started and
+        cancel that strategy's resting orders from here."""
+        bot = BOTS[name]
+        proc = self.procs.get(name)
+        deadline = time.time() + STOP_GRACE
+        while time.time() < deadline:
+            await asyncio.sleep(0.5)
+            if proc is not None and proc.returncode is not None:
+                break
+            status = self.bot_file(bot["status"])
+            if proc is None and (status is None or status["age"] > 6):
+                break
+        else:
+            self.stopping.pop(name, None)
+            if proc is not None and proc.returncode is None:
+                proc.kill()
+                await proc.wait()
+                for order in list(self.resting):
+                    if order.strat_id == bot["strat_id"]:
+                        with contextlib.suppress(Exception):
+                            await send_cancel(self.session, instrument=order.key.instrument,
+                                              side=order.key.side, price=order.key.price)
+                self.alert("serious", f"{bot['label']} did not stop in {STOP_GRACE:.0f} s: killed it "
+                           f"and cancelled {bot['strat_id']}'s orders. Check them on Orders & fills.")
+            else:
+                self.alert("serious", f"{bot['label']} has not stopped: it was started in a terminal, "
+                           "so press Ctrl+C there.")
+            return
+        self.stopping.pop(name, None)
+        if proc is not None and proc.returncode not in (0, None):
+            self.alert("serious", f"{bot['label']} stopped but exited with code {proc.returncode}: some "
+                       f"of its orders may still rest. Check Orders & fills and logs/{name}-console.log.")
+        else:
+            self.alert("warning", f"{bot['label']} stopped and cancelled its orders")
+
+    async def stop_owned(self) -> None:
+        """When the dashboard exits, stop the bots it started."""
+        owned = [n for n, p in self.procs.items() if p.returncode is None]
+        if not owned:
+            return
+        log.info("stopping the bots this dashboard started: %s", ", ".join(owned))
+        await asyncio.gather(*(self.stop_bot(n) for n in owned))
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(STOP_GRACE + 2):
+                await asyncio.gather(*(self.procs[n].wait() for n in owned))
+        for n in owned:
+            if self.procs[n].returncode is None:
+                self.procs[n].kill()
+                log.error("%s did not stop and was killed: check its orders on the console", n)
+
     async def cancel_all(self) -> None:
         await send_mass_cancel(self.session)
         self.alert("warning", "mass cancel sent: every resting order of the team")
@@ -889,6 +1014,27 @@ def make_app(hub: Hub) -> web.Application:
         hub.alert("warning", f"{'paused' if body.get('paused') else 'resumed'} quoting on "
                   f"{', '.join(targets)}")
         return web.json_response(data)
+
+    @routes.post("/api/bots/start")
+    async def bot_start(request: web.Request) -> web.Response:
+        if not same_origin(request):
+            raise web.HTTPForbidden()
+        body = await request.json()
+        if body.get("name") not in BOTS:
+            return web.json_response({"error": "unknown bot"}, status=400)
+        live = body.get("live") is True
+        if live and body.get("confirm") is not True:
+            return web.json_response({"error": "not confirmed"}, status=400)
+        return web.json_response(await hub.start_bot(body["name"], live, body.get("no_hedge") is True))
+
+    @routes.post("/api/bots/stop")
+    async def bot_stop(request: web.Request) -> web.Response:
+        if not same_origin(request):
+            raise web.HTTPForbidden()
+        body = await request.json()
+        if body.get("name") not in BOTS:
+            return web.json_response({"error": "unknown bot"}, status=400)
+        return web.json_response(await hub.stop_bot(body["name"]))
 
     @routes.post("/api/cancel-all")
     async def cancel_all(request: web.Request) -> web.Response:
@@ -943,8 +1089,11 @@ async def run(args: argparse.Namespace) -> None:
     ticker = asyncio.create_task(hub.ticker())
     try:
         async with session:
-            async for event in session:
-                await hub.on_event(event)
+            try:
+                async for event in session:
+                    await hub.on_event(event)
+            finally:
+                await hub.stop_owned()
     finally:
         ticker.cancel()
         await runner.cleanup()
