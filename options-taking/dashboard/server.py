@@ -610,6 +610,7 @@ class Hub:
             "markouts": self.markout_view(),
             "expiries": self.expiry_view(),
             "bot": self.bot_file(),
+            "stale": self.bot_file("stale-status.json"),
         }
 
     def sharpe_view(self) -> dict:
@@ -723,9 +724,9 @@ class Hub:
                         "reducing_only_in": max(0, dte - 5), "closed_in": max(0, dte - 3)})
         return out
 
-    def bot_file(self) -> dict | None:
+    def bot_file(self, name: str = "bot-status.json") -> dict | None:
         try:
-            data = json.loads((LOGS / "bot-status.json").read_text())
+            data = json.loads((LOGS / name).read_text())
         except (FileNotFoundError, json.JSONDecodeError):
             return None
         data["age"] = time.time() - data.get("t", 0)

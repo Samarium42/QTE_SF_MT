@@ -324,6 +324,12 @@ input[type=number] { width: 84px; }
     </div>
   </section>
   <section>
+    <h2>Stale-quote picker <span class="q" title="A separate strategy (strategy/stale_bot.py, its own strat_id). It crosses other teams' option quotes that sit on the wrong side of the wall mid by more than the taker fee plus min_edge, then cancels what is left. From logs/stale-status.json.">?</span></h2>
+    <p class="sub">Takes found and sent, fills, and edge against the wall mid at the fill.</p>
+    <div id="staleBox"></div>
+    <div class="scroll"><table id="staleTakes"></table></div>
+  </section>
+  <section>
     <h2>Bot log</h2>
     <p class="sub">Warnings, rejects, fills and hedges from <code>logs/bot-*.log</code>.</p>
     <div class="scroll"><ul class="feed" id="botEvents"></ul></div>
@@ -593,6 +599,23 @@ function renderAnalytics(a) {
       ${b.dry_run ? `<dt>Paper fills</dt><dd>${fmt(b.paper_fills)} contracts · ${usd(b.paper_edge)} edge vs mark</dd>` : ""}
     </dl>`;
   }
+  // stale-quote picker
+  const st = a.stale;
+  if (!st) $("staleBox").innerHTML = '<div class="empty">Not run yet. Start it with <code>python -m strategy.stale_bot --strat-id &lt;ID&gt; --dry-run</code>.</div>';
+  else {
+    const up = st.age <= 30, frac = st.messages_last_minute / st.budget_per_minute;
+    $("staleBox").innerHTML = `<dl class="kv">
+      <dt>State</dt><dd><span class="dot ${up ? (st.dry_run ? "warning" : "good") : "critical"}"></span> ${up ? (st.dry_run ? "running, dry run (sends nothing)" : "running, live") : "not running (last seen " + ago(st.age) + ")"}${up && !st.trading ? " · not taking (closed, near the close, or reconciling)" : ""}</dd>
+      <dt>Strategy ID</dt><dd>${esc(st.strat_id)}</dd>
+      <dt>Takes</dt><dd>${fmt(st.seen)} found · ${fmt(st.sent)} sent · ${fmt(st.filled)} contracts filled</dd>
+      <dt title="Dollars the fills were better than the wall mid at the time of the fill, before fees">Edge at fill</dt><dd>${usd(st.fill_edge)}</dd>
+      <dt title="This strategy's own slice of the team's 2,400 per minute">Message budget</dt>
+      <dd>${fmt(st.messages_last_minute)} / ${fmt(st.budget_per_minute)} per min ${st.budget_paused ? '<span class="neg">· paused after a budget reject</span>' : ""}${meter(frac, 0.8, frac >= 0.8 ? "serious" : "")}</dd>
+    </dl>`;
+  }
+  table("staleTakes", [["Time"], ["Contract"], ["Trade"], ["Size", 1], ["At", 1], ["Wall mid", 1], ["Edge / share", 1, "After the $0.30 taker fee"]],
+    (st ? st.recent : []).map((r) => [hhmm(r.t), esc(r.contract), `<span class="chip ${r.side === "BUY" ? "buy" : "sell"}">${r.side}</span>`, fmt(r.size), fmt(r.price, 2), fmt(r.fair, 3), fmt(r.edge, 3)]),
+    "No stale quotes found yet.");
   if (S) banner(S, A);
 }
 

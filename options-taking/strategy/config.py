@@ -70,3 +70,28 @@ class Settings:
     # holds this long before quoting again.
     stall_seconds: float = 10.0
     stall_hold_seconds: float = 5.0
+
+
+@dataclass(frozen=True)
+class StaleSettings:
+    """The stale-quote picker (strategy/stale_bot.py), a separate strategy from the quoter."""
+
+    limits: ExchangeLimits = ExchangeLimits()
+    # Fraction of each exchange risk limit this strategy keeps to. The quoter's fraction
+    # is separate, but both trade the one team book, so keep the two summing under 1.
+    risk_fraction: Decimal = Decimal("0.25")
+    soft_loss: Decimal = Decimal("20_000")  # reduce-only once the day's loss reaches this
+
+    # Least edge per share against the wall mid, after the taker fee, worth crossing for.
+    min_edge: Decimal = Decimal("0.02")
+    taker_fee_per_contract: Decimal = Decimal("0.30")
+    max_order: int = 10  # contracts per take (exchange cap 25)
+    max_position: int = 10  # contracts held long or short in one contract
+    # Least seconds between two takes on one contract, so a quote we already hit (whose
+    # book has not caught up) is not hit twice.
+    cooldown_seconds: float = 1.0
+    # Messages: the team's 2,400 per minute is shared. The SDK pacer keeps each process at
+    # 80% of its own budget: quoter 1,920 + dashboard 192 + this 240 = 2,352 per minute.
+    sustained_per_minute: int = 300
+    burst_per_second: int = 100
+    account_query_seconds: float = 30.0
