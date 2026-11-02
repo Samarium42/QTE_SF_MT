@@ -40,6 +40,50 @@ The bot must be supervised (Rule 1008). The exchange has **no cancel-on-disconne
   - **Cancel all** on the dashboard mass-cancels every team order. Use it in an emergency.
 - **If it was down anyway:** restart it. On start it adopts any of its orders still resting and requotes them from fresh prices. After a gap of 10 s or more in market updates (sleep, stalled link), it cancels its quotes, refreshes the account, and waits 5 s before quoting again.
 
+## Backtesting
+
+```sh
+python -m strategy.backtest --from 2026-10-28 --to 2026-10-30            # current settings
+python -m strategy.backtest --from 2026-10-28 --no-hedge --fill-share 0.15  # what-ifs
+python -m strategy.backtest --from 2026-10-28 --strikes 6 --quote-size 5 --max-position 20
+```
+
+The backtest replays past sessions from the exchange's **history service**: every book, print, mark and Greeks message, as the live feed sent them. They are replayed through the **real quoter code** (`SimBot` in `strategy/sim.py`) against a simulated exchange. A day is downloaded once into `logs/history-cache/` (about 180 MB) and then replays in under a minute. Results go to `logs/backtest/<time>/`: `summary.json`, `days.csv` and `fills.csv` (every fill with its markouts).
+
+**What the simulator models:**
+- Trade-based fills at our own price from eligible prints (κ = 0.45, 25-contract cap, live-print kinds only, not feed-only).
+- The 150 ms order delay.
+- Stale purge when the wall reaches an order.
+- Taker fills when a quote crosses another team's order.
+- Hedges at the wall's level one.
+- Rebates and fees.
+- Rule 6006 hedge-sign breaches, counted (live, each starts a cure).
+- Positions carry across days.
+
+**What it can't model:** queue priority against other teams, so `--fill-share` stands in for it; other teams reacting to us; cures and forced reductions.
+
+**Calibration:** `--fill-share 0.25` (the default) reproduces our real 28 Oct fills: 133 contracts simulated against 121 real, in the same windows. The history's other-team orders include *our own* live orders on days we traded, so "crossed" counts on those days are overstated.
+
+**First results (28–30 Oct, 10-lots, 8 strikes, own hedging):**
+- **Edge:** markouts of **+$10 per contract** at 1 s, 1 min and 5 min alike, with very few losers. The edge from prints is real and isn't adverse selection.
+- **Risk:** the intraday drawdown hit **−$37k on 30 Oct**. The soft stop caught it and the day closed positive.
+- **Hedging:** **40 simulated Rule 6006 breaches** in 3 days. The quoter's own hedging still trips the hedge-sign rule at this size, so run the team hedger, or fix the hedging, before sizing up.
+- **The P&L itself (+$23.8k):** it's optimistic. 1,823 of the 2,921 contracts were "crosses", inflated as explained above. Real days were far smaller.
+
+## Paper trading
+
+```sh
+python -m strategy.paper              # quoter with its own hedging, on the live feed
+python -m strategy.paper --no-hedge   # as it would run next to hedger.py
+python -m strategy.paper --reset      # start a fresh paper book
+```
+
+The same simulator runs on the live market: real data, simulated fills. **It never sends an order and needs no strategy ID**, so it can run next to the live bots to try a change first. The paper book carries across restarts and days (`logs/paper-book.json`). Fills go to `logs/paper-fills.jsonl`, daily results to `logs/paper-days.json`, and status to `logs/paper-status.json`.
+
+## Running it in the cloud
+
+See [deploy/README.md](deploy/README.md): a free Google Cloud e2-micro, systemd services that restart the bots and stop them cleanly, a daily restart before the open, and alerts to a Discord or Slack webhook (`deploy/notify.py`) so the team can supervise from a phone.
+
 ## Dashboard
 
 ```sh
@@ -100,11 +144,13 @@ Hedges take what's shown at the stock wall's touch (about 20 shares a level); th
 
 ### When it stops adding risk
 
-The bot quotes **reduce-only**, sizing each order to no more than closes the position, when:
+**Stop-losses** run on the day's P&L from the account, so a restart sees the same numbers. They only tighten during the day and reset at the next session:
 
-- the day's loss reaches −$60k (the exchange warns at −$90k and halts at −$150k),
-- the account is in a cure, or
-- any held contract's Greeks are missing.
+- **Drawdown:** P&L falls **$15k below the day's best** → reduce-only. The day's best is kept in `logs/peak-<strategy>-<date>.json`, so it survives a restart.
+- **Soft:** a day loss of **−$25k** → reduce-only.
+- **Hard:** a day loss of **−$40k** → no quotes at all for the rest of the day. Hedging carries on.
+
+All three act well before the exchange's −$90k warning and −$150k halt. The bot also quotes **reduce-only**, sizing each order to no more than closes the position, when the account is in a cure or any held contract's Greeks are missing.
 
 It skips a contract for 30 s after an unexpected reject. Two rejects don't trigger that skip:
 
@@ -123,7 +169,9 @@ It skips a contract for 30 s after an unexpected reject. Two rejects don't trigg
 | `requote_seconds` / `requote_ticks` | 2.0 / 1 | least time and price move worth an amend |
 | `hedge_threshold` | $100k | unhedged delta before hedging |
 | `hedge_buffer_fills` | 1 | delta left unhedged, in maximum fills |
-| `soft_loss` | $60k | reduce-only below this day loss |
+| `drawdown_stop` | $15k | reduce-only once P&L is this far below the day's best |
+| `soft_loss` | $25k | reduce-only at this day loss |
+| `hard_loss` | $40k | no quotes for the rest of the day at this loss |
 | `stop_before_close_seconds` | 600 | stop quoting this long before the close |
 | `account_query_seconds` | 5 | how often it asks for the account (positions, P&L, cure) |
 | `stall_seconds` / `stall_hold_seconds` | 10 / 5 | the dead-man on wake |
@@ -139,7 +187,7 @@ Exchange limits are in `ExchangeLimits` at the top of the file. Check them again
 | Dollar gamma, summed | $720k | $1.44M |
 | Gross | $1.875M | $3.75M |
 | Net delta per underlying | $750k, hedged beyond the buffer | $1.5M |
-| Daily loss | reduce-only from −$60k | warn −$90k, **halt −$150k** |
+| Daily loss | reduce-only at −$25k or a $15k drawdown; stop at −$40k | warn −$90k, **halt −$150k** |
 
 ### First live day (28 Oct, practice week)
 

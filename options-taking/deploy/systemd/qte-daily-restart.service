@@ -1,0 +1,6 @@
+[Unit]
+Description=QTE San Francisco: restart the bots before the open (fresh dated logs, clean state)
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'for u in qte-quoter qte-hedger qte-picker qte-paper qte-dashboard qte-notify; do systemctl is-enabled --quiet $u && systemctl restart $u; done; true'

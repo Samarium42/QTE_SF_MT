@@ -1,0 +1,17 @@
+[Unit]
+Description=QTE San Francisco: paper trading (no orders sent)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@DIR@
+EnvironmentFile=/etc/qte/bots.env
+ExecStart=@DIR@/.venv/bin/python -m strategy.paper $PAPER_FLAGS
+KillSignal=SIGINT
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,19 @@
+[Unit]
+Description=QTE San Francisco: picker (live orders)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@DIR@
+EnvironmentFile=/etc/qte/bots.env
+ExecStart=@DIR@/.venv/bin/python -m strategy.stale_bot --strat-id ${PICKER_STRAT_ID} $PICKER_FLAGS
+# SIGINT is Ctrl+C: the bot cancels its own orders before it exits.
+KillSignal=SIGINT
+TimeoutStopSec=30
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

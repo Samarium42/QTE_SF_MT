@@ -1,0 +1,10 @@
+[Unit]
+Description=Restart the QTE bots each weekday before the open
+
+[Timer]
+# 12:00 UTC is before both session opens (13:30 or 14:30 London).
+OnCalendar=Mon..Fri 12:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

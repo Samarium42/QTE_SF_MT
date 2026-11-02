@@ -29,8 +29,11 @@ class Settings:
     limits: ExchangeLimits = ExchangeLimits()
     # Fraction of each exchange risk limit the bot keeps to.
     risk_fraction: Decimal = Decimal("0.5")
-    # Stop opening risk once the day's loss reaches this (the exchange halts at $150k).
-    soft_loss: Decimal = Decimal("60_000")
+    # Stop-losses on the day's P&L (strategy/bot.py, check_stops). The exchange warns at
+    # -$90k and halts at -$150k; these act well before that.
+    drawdown_stop: Decimal = Decimal("15_000")  # reduce-only once P&L is this far below the day's best
+    soft_loss: Decimal = Decimal("25_000")  # reduce-only at this day loss
+    hard_loss: Decimal = Decimal("40_000")  # no quotes for the rest of the day at this loss
 
     # Which contracts: per underlying, the nearest strikes to the forward in the nearest
     # expiry open to new positions, calls and puts both.

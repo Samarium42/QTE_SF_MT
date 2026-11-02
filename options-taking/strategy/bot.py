@@ -82,6 +82,10 @@ BUDGET_REJECTS = frozenset(
     {ReasonCodes.MESSAGE_BUDGET_EXCEEDED, ReasonCodes.BURST_CAP_EXCEEDED}
 )
 STATUS = Path("logs/bot-status.json")  # read by the dashboard
+
+
+def peak_file(strat_id: str, day: str) -> Path:
+    return Path("logs") / f"peak-{strat_id}-{day}.json"
 CONTROL = Path("control.json")  # written by the dashboard: {"paused": ["SPY", ...]}
 PENDING_TIMEOUT = 3.0  # seconds before an unanswered message no longer blocks its quote
 BUDGET_PAUSE = 61.0
@@ -98,8 +102,11 @@ class Slot:
 
 class Bot:
     def __init__(self, session: ReconnectingSession, strat_id: str, cfg: Settings, dry_run: bool,
-                 hedging: bool = True):
+                 hedging: bool = True, clock=time):
         self.session = session
+        # Anything with monotonic() and time(): the time module live, a replay's clock in a
+        # backtest (strategy/sim.py).
+        self.clock = clock
         self.hedging = hedging  # False when strategy/hedger.py hedges the book instead
         self.strat_id = strat_id
         self.cfg = cfg
@@ -140,6 +147,11 @@ class Bot:
         self.paper_edge = Decimal(0)  # dollars against the mark, before the maker rebate
         self.last_grid_wall = 0.0  # wall clock of the last grid tick, to spot a stall
         self.hold_until = 0.0  # no quoting until then, after a stall
+        self.peak_pnl: Decimal | None = None  # the day's best P&L, for the drawdown stop
+        self.peak_date = ""
+        self.stop = ""  # the stop-loss in force: "", "drawdown", "soft" or "hard"
+        self.persist_state = True  # the peak file and status file; off in a backtest
+        self.status_path = STATUS
 
     # ---------- reading ----------
 
@@ -209,6 +221,7 @@ class Bot:
         elif isinstance(item, SessionState):
             if self.state is None or self.state.session_date != item.session_date:
                 self.quoting = []
+                self.stop = ""
             self.state = item
 
     def on_account_report(self, report: object) -> None:
@@ -254,7 +267,7 @@ class Bot:
         name = reason_code_name(reason)
         if reason in BUDGET_REJECTS:
             log.warning("message budget reject (%s): pausing order messages for a minute", name)
-            self.paused_until = time.monotonic() + BUDGET_PAUSE
+            self.paused_until = self.clock.monotonic() + BUDGET_PAUSE
         elif reason in (ReasonCodes.MIN_REST_VIOLATION, ReasonCodes.NO_ORDER_AT_LEVEL,
                         ReasonCodes.AMEND_PRICE_AT_OR_BEYOND_WALL):
             # The wall moved while the amend was in flight: the next tick requotes from the
@@ -263,7 +276,7 @@ class Bot:
         else:
             log.warning("reject %s on %s %s", name, instrument, SIDE_NAME.get(side))
             if instrument:
-                self.blocked_until[instrument] = time.monotonic() + 30.0
+                self.blocked_until[instrument] = self.clock.monotonic() + 30.0
 
     def paper_fill(self, trades: Trades) -> None:
         """In a dry run, count the prints that would have filled the quotes we would rest: a
@@ -412,7 +425,7 @@ class Bot:
                 complete: bool) -> dict[int, tuple[int, int] | None]:
         """For each side, the (price, size) to rest, or None to rest nothing."""
         none: dict[int, tuple[int, int] | None] = {BUY: None, SELL: None}
-        if self.blocked_until.get(contract, 0.0) > time.monotonic():
+        if self.blocked_until.get(contract, 0.0) > self.clock.monotonic():
             return none
         tick = self.tick_of(contract)
         book = self.books.get(contract)
@@ -445,7 +458,7 @@ class Bot:
         reduce_only = (
             not complete
             or self.in_cure
-            or self.daily_pnl <= -self.cfg.soft_loss
+            or self.stop != ""
         )
         leg = self.leg(contract, pos)
         if leg is None:
@@ -471,7 +484,7 @@ class Bot:
     # ---------- acting ----------
 
     async def on_grid(self) -> None:
-        now = time.monotonic()
+        now = self.clock.monotonic()
         if now - self.last_status > 30:
             self.last_status = now
             self.log_status()
@@ -494,7 +507,8 @@ class Bot:
             return
 
         self.read_control()
-        down = self.winding_down()
+        self.check_stops()
+        down = self.winding_down() or self.stop == "hard"
         exposure, complete = self.exposure()
         limits = self.soft_limits()
         wanted: dict[tuple[str, int], tuple[int, int] | None] = {}
@@ -520,7 +534,7 @@ class Bot:
         """Dead-man on wake: after a gap in grid ticks (the machine slept, or the link stalled)
         our quotes were unmanaged, so cancel them all, refresh the account, and hold quoting a
         moment before quoting again from fresh state."""
-        wall = time.time()
+        wall = self.clock.time()
         gap = wall - self.last_grid_wall if self.last_grid_wall else 0.0
         self.last_grid_wall = wall
         if gap < self.cfg.stall_seconds or self.dry_run:
@@ -531,6 +545,39 @@ class Bot:
         self.hold_until = now + self.cfg.stall_hold_seconds
         self.account_known = False
         await self.query_account()
+
+    def check_stops(self) -> None:
+        """Stop-losses on the day's P&L, from the account (so a restart sees the same P&L):
+        - drawdown: P&L has fallen `drawdown_stop` below the day's best -> reduce-only;
+        - soft: P&L at or below -soft_loss -> reduce-only;
+        - hard: P&L at or below -hard_loss -> no quotes at all for the rest of the day
+          (hedging carries on, and the exchange's own warning and halt still apply).
+        The day's best is kept in logs/peak-STRAT-DATE.json so a restart keeps the drawdown."""
+        if not self.account_known or self.state is None:
+            return
+        day, pnl = self.state.session_date, self.daily_pnl
+        if self.peak_date != day:
+            self.peak_date, self.peak_pnl = day, None
+            if self.persist_state:
+                with contextlib.suppress(OSError, ValueError, KeyError):
+                    self.peak_pnl = Decimal(str(json.loads(peak_file(self.strat_id, day).read_text())["peak"]))
+        if self.peak_pnl is None or pnl > self.peak_pnl:
+            self.peak_pnl = max(pnl, Decimal(0))
+            if self.persist_state:
+                with contextlib.suppress(OSError):
+                    peak_file(self.strat_id, day).write_text(json.dumps({"peak": float(self.peak_pnl)}))
+        cfg = self.cfg
+        stop = ("hard" if pnl <= -cfg.hard_loss
+                else "soft" if pnl <= -cfg.soft_loss
+                else "drawdown" if self.peak_pnl - pnl >= cfg.drawdown_stop
+                else "")
+        # A stop only tightens during the day: it never lifts until the next session.
+        order = ["", "drawdown", "soft", "hard"]
+        if order.index(stop) > order.index(self.stop):
+            log.warning("STOP-LOSS %s: day P&L %s, best %s; %s", stop, round(pnl),
+                        round(self.peak_pnl),
+                        "quoting stopped for the day" if stop == "hard" else "reduce-only")
+            self.stop = stop
 
     def scan_arbitrage(self) -> None:
         """Log no-arbitrage violations in each underlying's front expiry, priced at the walls
@@ -608,7 +655,7 @@ class Bot:
                             price=resting.key.price, new_size=size, new_price=price)
 
     def count_message(self) -> None:
-        now = time.monotonic()
+        now = self.clock.monotonic()
         self.sent_times.append(now)
         while self.sent_times and now - self.sent_times[0] > 60:
             self.sent_times.popleft()
@@ -621,7 +668,7 @@ class Bot:
         while self.sent_times and now - self.sent_times[0] > 60:
             self.sent_times.popleft()
         status = {
-            "t": time.time(),
+            "t": self.clock.time(),
             "strat_id": self.strat_id,
             "dry_run": self.dry_run,
             "market_open": self.market_open(),
@@ -636,11 +683,12 @@ class Bot:
             "daily_pnl": float(self.daily_pnl),
             "in_cure": self.in_cure,
             "hedging": self.hedging,
+            "stop": self.stop,
         }
         with contextlib.suppress(OSError):
-            tmp = STATUS.with_suffix(".tmp")
+            tmp = self.status_path.with_suffix(".tmp")
             tmp.write_text(json.dumps(status))
-            tmp.replace(STATUS)
+            tmp.replace(self.status_path)
 
     async def send(self, slot: Slot, now: float, fn, **kwargs) -> None:
         self.count_message()
@@ -687,16 +735,20 @@ class Bot:
             self.hedge_pending[ref] = (underlying, now)
             log.info("HEDGE %s %s %d @ %s", SIDE_NAME[side], underlying, abs(shares),
                      to_decimal(price))
-            try:
-                self.count_message()
-                await send_new(self.session, strat_id=self.strat_id, instrument=underlying,
-                               side=side, order_type=LIMIT, price=price, size=abs(shares),
-                               request_ref=ref)
-            except Exception as error:
-                log.warning("hedge send failed: %s", error)
+            await self.send_hedge(ref, underlying, side, price, abs(shares))
+
+    async def send_hedge(self, ref: str, underlying: str, side: int, price: int,
+                         shares: int) -> None:
+        try:
+            self.count_message()
+            await send_new(self.session, strat_id=self.strat_id, instrument=underlying,
+                           side=side, order_type=LIMIT, price=price, size=shares,
+                           request_ref=ref)
+        except Exception as error:
+            log.warning("hedge send failed: %s", error)
 
     async def query_account(self) -> None:
-        self.last_query = time.monotonic()
+        self.last_query = self.clock.monotonic()
         with contextlib.suppress(Exception):
             await self.account.query(self.session)
 
@@ -723,6 +775,19 @@ class Bot:
         )
 
 
+def code_version() -> str:
+    """The git commit this code runs from (with "+dirty" for uncommitted changes)."""
+    try:
+        here = Path(__file__).resolve().parent
+        head = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=here, text=True,
+                              capture_output=True, timeout=5).stdout.strip()
+        dirty = subprocess.run(["git", "status", "--porcelain", "--", "."], cwd=here, text=True,
+                               capture_output=True, timeout=5).stdout.strip()
+        return (head or "unknown") + ("+dirty" if dirty else "")
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+
+
 def keep_awake() -> None:
     """On a Mac, hold off idle and system sleep for as long as this process lives: asleep, the
     bot cannot manage its quotes but they stay live on the exchange. A closed lid still
@@ -744,6 +809,9 @@ async def run(args: argparse.Namespace) -> int:
                          burst_per_second=lim.burst_per_second))
     session = ReconnectingSession(pacing=pacer)
     bot = Bot(session, args.strat_id, cfg, args.dry_run, hedging=not args.no_hedge)
+    # Rule 1008: keep the deployed version and configuration attributable.
+    log.info("starting %s as %s, version %s, hedging %s; %s", "dry run" if args.dry_run else "live",
+             args.strat_id, code_version(), not args.no_hedge, cfg)
     if not args.dry_run:
         keep_awake()
 

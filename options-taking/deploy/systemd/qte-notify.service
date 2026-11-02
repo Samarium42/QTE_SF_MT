@@ -1,0 +1,15 @@
+[Unit]
+Description=QTE San Francisco: post bot warnings and errors to the team webhook
+After=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@DIR@
+EnvironmentFile=/etc/qte/bots.env
+ExecStart=@DIR@/.venv/bin/python -m deploy.notify
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

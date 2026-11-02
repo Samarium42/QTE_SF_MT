@@ -1,0 +1,15 @@
+[Unit]
+Description=QTE San Francisco: dashboard on 127.0.0.1:8050 (reach it over an SSH tunnel)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@DIR@
+ExecStart=@DIR@/.venv/bin/python -m dashboard.server
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
