@@ -123,7 +123,9 @@ class HedgerSettings:
     pending_timeout_seconds: float = 2.0
     # Stop sending this long before the close (the close cancels everything anyway).
     stop_before_close_seconds: int = 60
-    # Messages: a small slice of the team's 2,400 per minute (see StaleSettings for the sum).
-    sustained_per_minute: int = 100
-    burst_per_second: int = 20
+    # Messages: a slice of the team's 2,400 per minute (see StaleSettings for the sum). At 100
+    # the start-up subscriptions (~80 instruments) used most of the minute and the pacer then
+    # froze the hedger for ~50 s with delta unhedged (2 Nov); 400 leaves room for both.
+    sustained_per_minute: int = 400
+    burst_per_second: int = 50
     account_query_seconds: float = 5.0
