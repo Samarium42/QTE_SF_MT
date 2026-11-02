@@ -9,3 +9,5 @@ logs/
 control.json
 control.tmp
 .DS_Store
+# Supervisor settings on the host: strategy IDs and the ntfy topic.
+ops.env

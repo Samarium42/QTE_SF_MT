@@ -102,6 +102,7 @@ from dashboard.analytics import (
     smile_iv,
 )
 from dashboard.structures import LegSpec, execution_order, legs
+from ops.config import strat_id
 from strategy.bs import black76
 from strategy.config import Settings
 from strategy.risk import MULTIPLIER
@@ -120,13 +121,14 @@ LEG_WAIT = 2.0  # seconds to wait for a leg's fills before giving up on its rema
 STARTING_EQUITY = 2_500_000.0  # E0: the term's reset opening equity (Rule 9001)
 SOFR = 0.043  # approximate; only sets the idle-cash benchmark the Sharpe subtracts
 # The strategy bots the page can start and stop: module, registered strat_id, status file.
+# Strategy IDs come from QTE_QUOTER_ID / QTE_PICKER_ID / QTE_HEDGER_ID when set (ops/config.py).
 BOTS = {
     "quoter": {"label": "Print-capture quoter", "module": "strategy.bot",
-               "strat_id": "sf_print_capture_v1", "status": "bot-status.json"},
+               "strat_id": strat_id("quoter"), "status": "bot-status.json"},
     "picker": {"label": "Stale-quote picker", "module": "strategy.stale_bot",
-               "strat_id": "sf_stale_picker_v1", "status": "stale-status.json"},
+               "strat_id": strat_id("picker"), "status": "stale-status.json"},
     "hedger": {"label": "Delta hedger", "module": "strategy.hedger",
-               "strat_id": "sf_delta_hedger_v1", "status": "hedger-status.json"},
+               "strat_id": strat_id("hedger"), "status": "hedger-status.json"},
 }
 STOP_GRACE = 15.0  # seconds a bot gets to stop itself before its process is killed
 SPOT_MOVES = [-0.05, -0.02, -0.01, 0.0, 0.01, 0.02, 0.05]

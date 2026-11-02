@@ -40,6 +40,21 @@ The bot must be supervised (Rule 1008). The exchange has **no cancel-on-disconne
   - **Cancel all** on the dashboard mass-cancels every team order. Use it in an emergency.
 - **If it was down anyway:** restart it. On start it adopts any of its orders still resting and requotes them from fresh prices. After a gap of 10 s or more in market updates (sleep, stalled link), it cancels its quotes, refreshes the account, and waits 5 s before quoting again.
 
+## Running unattended
+
+`python -m ops.supervisor` runs the hedger, the quoter (`--no-hedge`) and the picker on the
+session schedule, restarts them when they crash or hang, mass-cancels when it has to give up
+on one, and pushes alerts to phones through ntfy. On an always-on Linux host systemd keeps
+it running. Setup, free hosts and day-to-day commands: [deploy/README.md](deploy/README.md).
+
+```sh
+python -m ops.supervisor --now --dry-run   # try it: ignore the schedule, send nothing
+python -m ops.emergency                    # cancel every team order, as Cancel all does
+```
+
+Strategy IDs for the supervisor and the dashboard come from `QTE_QUOTER_ID`, `QTE_HEDGER_ID`
+and `QTE_PICKER_ID` when set.
+
 ## Dashboard
 
 ```sh
@@ -155,7 +170,7 @@ Markouts that hold or grow over time mean we aren't being picked off: the edge i
 
 ### Next improvements
 
-1. **An always-on host** (a small cloud VM, or a desktop that stays on). This is the biggest lever: about 40% of the first day was lost to sleep and restarts.
+1. **An always-on host** (a small cloud VM, or a desktop that stays on). This is the biggest lever: about 40% of the first day was lost to sleep and restarts. The supervisor and deploy kit (`ops/`, `deploy/`) are built for this; what's left is picking the host.
 2. **Don't cross other teams' orders inside the wall.** Check our price against the best resting student order before sending, so we stay the maker. 19 fills on day one paid the taker fee because of this.
 3. **Hedge with resting orders** just inside the stock wall, to earn the maker rebate instead of paying the taker fee.
 4. **Quote around a smile fair value.** Fit a vega-weighted smile (the dashboard's mispricing scanner already does) and lean quotes towards the cheap side.

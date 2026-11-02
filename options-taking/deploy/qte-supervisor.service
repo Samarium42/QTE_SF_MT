@@ -1,0 +1,38 @@
+# systemd unit for the supervisor (ops/supervisor.py). install.sh puts it in
+# /etc/systemd/system/. The supervisor starts and stops the bots on the session schedule
+# itself; systemd only keeps the supervisor alive.
+[Unit]
+Description=QTE SF options taking: strategy supervisor (hedger, quoter, picker)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=qte
+Group=qte
+WorkingDirectory=/opt/qte/QTE_SF_MT/options-taking
+EnvironmentFile=/etc/qte/ops.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/qte/QTE_SF_MT/options-taking/.venv/bin/python -m ops.supervisor
+# SIGTERM to the supervisor alone: it stops each bot through control.json, so they cancel
+# their own orders. Whatever is left after TimeoutStopSec is killed.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=90
+# The supervisor died or was killed, so bots may have died with orders resting: the exchange
+# has no cancel-on-disconnect. Mass-cancel before the restart (a clean stop skips this).
+ExecStopPost=/bin/sh -c 'if [ "$SERVICE_RESULT" != "success" ]; then /opt/qte/QTE_SF_MT/options-taking/.venv/bin/python -m ops.emergency; fi'
+Restart=always
+RestartSec=10
+# Exit 2 is a set-up problem (no token, no address): restarting will not fix it.
+RestartPreventExitStatus=2
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/qte
+
+[Install]
+WantedBy=multi-user.target
