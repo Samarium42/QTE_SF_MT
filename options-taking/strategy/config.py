@@ -110,8 +110,8 @@ class HedgerSettings:
     # of the exchange's per-underlying delta limit ($1.5M), and hedge it back down to
     # target_fraction of that limit, not to zero. What is left unhedged is room for fills
     # to land without taking option delta through zero against the stock (Rule 6006).
-    trigger_fraction: Decimal = Decimal("0.25")  # $375k
-    target_fraction: Decimal = Decimal("0.15")  # $225k
+    trigger_fraction: Decimal = Decimal("0.10")  # $150k
+    target_fraction: Decimal = Decimal("0.05")  # $75k
     # The qualifying band per underlying is |H| <= |D| + tolerance. Rule 6006 allows $100k
     # per underlying but only $150k summed over both, so $75k each keeps both tests.
     tolerance: Decimal = Decimal("75_000")
