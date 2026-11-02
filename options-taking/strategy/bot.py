@@ -247,12 +247,16 @@ class Bot:
             )
         if isinstance(message, Reject) and ref is not None:
             self.on_reject(message, ref)
-        # Any report about one of our quotes settles the message in flight on it.
-        instrument = getattr(message, "instrument", None)
-        side = getattr(message, "side", None)
-        slot = self.slots.get((instrument, side)) if instrument else None
-        if slot is not None and not isinstance(message, Reject):
-            slot.pending = None
+        # A report that answers the message in flight on one of our quotes settles it. Only
+        # that message's own report: a late report about an older order on the same quote
+        # (its fill or purge) used to settle a newer `new` still in flight, so the next tick
+        # sent a second order on the same side (duplicate orders, 2 Nov). Replies such as
+        # Accepted name the request, not the contract, so match on the reference.
+        if ref is not None and not isinstance(message, Reject):
+            for slot in self.slots.values():
+                if slot.pending == ref:
+                    slot.pending = None
+                    break
 
     def on_reject(self, message: Reject, ref: str) -> None:
         for (instrument, side), slot in self.slots.items():
@@ -640,7 +644,17 @@ class Bot:
             return
         if slot.pending is not None and now - slot.sent_at < PENDING_TIMEOUT:
             return
-        resting = self.own_order(contract, side)
+        mine = [o for o in self.resting if o.strat_id == self.strat_id
+                and o.key.instrument == contract and o.key.side == side]
+        if len(mine) > 1:
+            # One quote per side: cancel the extras, one per tick, before anything else.
+            extra = mine[-1]
+            log.warning("cancelling a duplicate %s %s order at %s", contract, SIDE_NAME[side],
+                        to_decimal(extra.key.price))
+            await self.send(slot, now, send_cancel, instrument=contract, side=side,
+                            price=extra.key.price)
+            return
+        resting = mine[0] if mine else None
         if target is None:
             if resting is not None:
                 await self.send(slot, now, send_cancel, instrument=contract, side=side,
