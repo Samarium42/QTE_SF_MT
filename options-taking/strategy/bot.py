@@ -455,6 +455,15 @@ class Bot:
             bid = bid - back_off if bid - back_off > book.bid_levels[0].price else None
         if pos < 0 and ask is not None:
             ask = ask + back_off if ask + back_off < book.ask_levels[0].price else None
+        # Never cross another team's order: that trades at once as a taker ($0.30 instead of
+        # the $0.20 rebate) and in bursts that move delta faster than the hedger can follow
+        # (the cure of 2 Nov). Stay a tick behind their best price, still inside the wall.
+        if book.student_ask_levels and bid is not None and bid >= book.student_ask_levels[0].price:
+            bid = book.student_ask_levels[0].price - tick
+            bid = bid if bid > book.bid_levels[0].price else None
+        if book.student_bid_levels and ask is not None and ask <= book.student_bid_levels[0].price:
+            ask = book.student_bid_levels[0].price + tick
+            ask = ask if ask < book.ask_levels[0].price else None
         reduce_only = (
             not complete
             or self.in_cure
