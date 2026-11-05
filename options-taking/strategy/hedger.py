@@ -58,7 +58,7 @@ from qte_sdk.resting import RestingOrders
 from qte_sdk.units import to_decimal
 
 from strategy.config import HedgerSettings
-from strategy.risk import MULTIPLIER, hedge_shares
+from strategy.risk import MULTIPLIER, band_hedge_shares, hedge_shares, ww_band
 
 log = logging.getLogger("sf_hedger")
 
@@ -103,6 +103,7 @@ class Hedger:
         self.last_status_file = 0.0
 
         self.last_delta: dict[str, Decimal] = {}  # last valid published delta per contract
+        self.last_gamma: dict[str, Decimal] = {}  # and gamma, per share per $1
         self.view: dict[str, dict] = {}  # per underlying, for the status file
         self.hedges = 0
         self.shares_filled = 0
@@ -218,6 +219,8 @@ class Hedger:
             g = self.greeks.get(instrument)
             if g is not None and g.status == OPTION_GREEKS_VALID and g.HasField("delta"):
                 self.last_delta[instrument] = greek_to_decimal(g.delta)
+            if g is not None and g.status == OPTION_GREEKS_VALID and g.HasField("gamma"):
+                self.last_gamma[instrument] = greek_to_decimal(g.gamma)
             # A failed Greek calculation keeps the last Greeks (Rule 6003): so do we.
             delta = self.last_delta.get(instrument)
             if delta is None:
@@ -226,6 +229,37 @@ class Hedger:
                 return None
             total += qty * MULTIPLIER * delta * to_decimal(spot)
         return total
+
+    def option_gamma(self, underlying: str) -> Decimal:
+        """Net gamma of the team's options in one underlying, in shares per $1 move. A
+        contract with no gamma yet counts as zero, which only narrows the band."""
+        total = Decimal(0)
+        for instrument, qty in self.positions.items():
+            if qty == 0 or not is_option_symbol(instrument):
+                continue
+            if parse_option_symbol(instrument).underlying != underlying:
+                continue
+            total += qty * MULTIPLIER * self.last_gamma.get(instrument, Decimal(0))
+        return total
+
+    def hedge_cost(self, underlying: str) -> Decimal:
+        """Cost of hedging as a fraction of notional: half the wall's spread now, half the
+        ladder walk we allow, and the taker fee."""
+        half_bp = self.cfg.default_half_spread_bp
+        book = self.books.get(underlying)
+        if book is not None and book.bid_levels and book.ask_levels:
+            bid, ask = book.bid_levels[0].price, book.ask_levels[0].price
+            if ask > bid > 0:
+                half_bp = Decimal(ask - bid) / Decimal(ask + bid) * 10_000
+        return (half_bp + self.cfg.max_slippage_bp / 2 + self.cfg.stock_taker_fee_bp) / 10_000
+
+    def band(self, underlying: str, spot: Decimal) -> Decimal:
+        """No-trade half-width in dollars of net delta for one underlying."""
+        if self.cfg.band_mode == "fixed":
+            return self.cfg.limits.net_delta_per_underlying * self.cfg.trigger_fraction
+        return ww_band(self.option_gamma(underlying), spot, self.hedge_cost(underlying),
+                       risk_aversion=self.cfg.risk_aversion,
+                       floor=self.cfg.band_floor, cap=self.cfg.band_cap)
 
     def read_quoter(self) -> None:
         """Whether the quoter is running live and hedging too, from its status file."""
@@ -264,15 +298,26 @@ class Hedger:
         view["net_delta"] = float(delta + shares_held * spot_d)
 
         lim = self.cfg.limits
-        # hedge_shares trades once |options + stock| passes `threshold`, and then hedges
-        # only the option delta beyond `buffer`, which leaves net delta at the target.
-        shares = hedge_shares(
-            delta, shares_held, spot_d,
-            threshold=lim.net_delta_per_underlying * self.cfg.trigger_fraction,
-            max_order=lim.max_hedge_order,
-            tolerance=self.cfg.tolerance,
-            buffer=lim.net_delta_per_underlying * self.cfg.target_fraction,
-        )
+        band = self.band(underlying, spot_d)
+        view["band"] = float(band)
+        view["gamma_shares"] = float(self.option_gamma(underlying))
+        if self.cfg.band_mode == "fixed":
+            # hedge_shares trades once |options + stock| passes `threshold`, and then hedges
+            # only the option delta beyond `buffer`, which leaves net delta at the target.
+            shares = hedge_shares(
+                delta, shares_held, spot_d,
+                threshold=band,
+                max_order=lim.max_hedge_order,
+                tolerance=self.cfg.tolerance,
+                buffer=lim.net_delta_per_underlying * self.cfg.target_fraction,
+            )
+        else:
+            # Whalley-Wilmott: nothing inside the band, and back to its edge when outside.
+            shares = band_hedge_shares(
+                delta, shares_held, spot_d,
+                band=band, rehedge_to=self.cfg.rehedge_to,
+                max_order=lim.max_hedge_order, tolerance=self.cfg.tolerance,
+            )
         view["want"] = shares
         if shares == 0 or not self.trading() or now < self.paused_until:
             return
@@ -357,6 +402,7 @@ class Hedger:
             "budget_paused": now < self.paused_until,
             "hedges": self.hedges, "shares_filled": self.shares_filled,
             "underlyings": self.view, "recent": list(self.recent),
+            "band_mode": self.cfg.band_mode,
             "trigger": float(self.cfg.limits.net_delta_per_underlying * self.cfg.trigger_fraction),
             "target": float(self.cfg.limits.net_delta_per_underlying * self.cfg.target_fraction),
         }

@@ -148,3 +148,78 @@ def hedge_shares(
     target = (-room if option_delta > 0 else room) / spot
     trade = int(target.to_integral_value(rounding="ROUND_DOWN")) - stock_shares
     return max(-cap, min(cap, trade))
+
+
+def ww_band(
+    gamma_shares: Decimal,
+    spot: Decimal,
+    cost: Decimal,
+    *,
+    risk_aversion: Decimal,
+    floor: Decimal,
+    cap: Decimal,
+) -> Decimal:
+    """Half-width, in dollars of delta, of the Whalley-Wilmott no-trade band.
+
+    Whalley and Wilmott (1997): with a proportional cost `cost` (a fraction of notional
+    paid on every share traded) and absolute risk aversion `risk_aversion` (per dollar),
+    the hedge should not trade while the share count is within
+
+        H = (3/2 * cost * spot * gamma^2 / risk_aversion) ** (1/3)    shares
+
+    of the Black-Scholes hedge, and on leaving the band it trades back to the band's edge.
+    `gamma_shares` is the book's gamma in shares per $1 of the underlying (sum of contracts
+    x 100 x per-share gamma), long or short alike. More gamma widens the band: each hedge
+    goes stale faster, so tight hedging pays the cost over and over for little risk saved.
+    Higher costs widen it too; more risk aversion narrows it.
+
+    The asymptotic formula goes to zero with gamma, and at zero the hedger would chase every
+    fill, so the result is held between `floor` and `cap`."""
+    if spot <= 0 or risk_aversion <= 0 or cost <= 0:
+        return floor
+    g = float(abs(gamma_shares))
+    shares = (1.5 * float(cost) * float(spot) * g * g / float(risk_aversion)) ** (1.0 / 3.0)
+    dollars = Decimal(str(round(shares * float(spot), 2)))
+    return max(floor, min(cap, dollars))
+
+
+def band_hedge_shares(
+    option_delta: Decimal,
+    stock_shares: int,
+    spot: Decimal,
+    *,
+    band: Decimal,
+    rehedge_to: Decimal,
+    max_order: Decimal,
+    tolerance: Decimal,
+) -> int:
+    """Signed shares to trade under a no-trade band of `band` dollars of net delta.
+
+    Nothing while |options + stock| <= band. Outside it, trade back to `rehedge_to` x band
+    on the same side (1 is the Whalley-Wilmott edge; less trades a little more each time so
+    the next hedge comes later). The stock stays a qualifying hedge (Rule 6006): opposite in
+    sign to the option delta and at most |option delta| + tolerance/2, half the rule's
+    tolerance so fills against an over-hedge cannot push it out. Stock already outside the
+    qualifying band is brought back first, as hedge_shares does. Orders capped at
+    `max_order` dollars."""
+    if spot <= 0:
+        return 0
+    cap = int(max_order / spot)
+    legal = int(((abs(option_delta) + tolerance) / spot).to_integral_value(rounding="ROUND_FLOOR"))
+    lo, hi = (-legal, 0) if option_delta > 0 else (0, legal) if option_delta < 0 else (0, 0)
+    if not lo <= stock_shares <= hi:
+        trade = min(max(stock_shares, lo), hi) - stock_shares
+        return max(-cap, min(cap, trade))
+    net = option_delta + stock_shares * spot
+    if abs(net) <= band:
+        return 0
+    inner = band * rehedge_to
+    target_net = inner if net > 0 else -inner
+    target = (target_net - option_delta) / spot
+    # Round towards the current position so the trade never overshoots the target.
+    trade = target - stock_shares
+    trade_i = int(trade.to_integral_value(rounding="ROUND_DOWN"))
+    safe = int(((abs(option_delta) + tolerance / 2) / spot).to_integral_value(rounding="ROUND_FLOOR"))
+    s_lo, s_hi = (-safe, 0) if option_delta > 0 else (0, safe) if option_delta < 0 else (0, 0)
+    new = min(max(stock_shares + trade_i, s_lo), s_hi)
+    return max(-cap, min(cap, new - stock_shares))

@@ -110,8 +110,32 @@ class HedgerSettings:
     # of the exchange's per-underlying delta limit ($1.5M), and hedge it back down to
     # target_fraction of that limit, not to zero. What is left unhedged is room for fills
     # to land without taking option delta through zero against the stock (Rule 6006).
+    # These two are the "fixed" mode only. The default is "ww" below.
     trigger_fraction: Decimal = Decimal("0.10")  # $150k
     target_fraction: Decimal = Decimal("0.05")  # $75k
+
+    # "ww": a Whalley-Wilmott no-trade band per underlying, from the book's net gamma in
+    # that underlying and the cost of a hedge (strategy.risk.ww_band). "fixed": the
+    # 150k/75k rule above. Run `python -m sim.hedge_sim` to compare the two before changing these.
+    band_mode: str = "ww"
+    # Absolute risk aversion, per dollar. The one free choice in the formula: higher hedges
+    # tighter (less P&L swing, more fees). 1e-3 is from sim/hedge_sim.py. Against fixed
+    # 150k/75k it roughly ties on SPY (cost $518 vs $566, swing about 3-8% wider) and beats
+    # it on GOOGL (swing -18%, -25% with an -8% gap) for $15-20 more cost per session.
+    # GOOGL sits on the floor, so raising this further only tightens SPY.
+    risk_aversion: Decimal = Decimal("1e-3")
+    # The band never goes below floor (so a near-zero-gamma book does not chase each fill)
+    # or above cap (so it stays well inside the $1.5M limit and the quoter's own limits).
+    band_floor: Decimal = Decimal("75_000")
+    band_cap: Decimal = Decimal("600_000")
+    # On leaving the band, trade back to this fraction of it (1 = the band's edge, as in
+    # Whalley-Wilmott). Under 1 leaves room so the next hedge comes later.
+    rehedge_to: Decimal = Decimal("1")
+    # Cost of a hedge, as a fraction of notional: half the wall's spread, read live from
+    # the book (default_half_spread_bp until there is one), plus half of max_slippage_bp for
+    # walking the ladder, plus the stock taker fee (0.30 bp, rulebook 2.13).
+    stock_taker_fee_bp: Decimal = Decimal("0.30")
+    default_half_spread_bp: Decimal = Decimal("1.5")
     # The qualifying band per underlying is |H| <= |D| + tolerance. Rule 6006 allows $100k
     # per underlying but only $150k summed over both, so $75k each keeps both tests.
     tolerance: Decimal = Decimal("75_000")
