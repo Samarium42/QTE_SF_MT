@@ -811,6 +811,23 @@ def code_version() -> str:
         return "unknown"
 
 
+def no_quickedit() -> None:
+    """On Windows, switch off QuickEdit in this process's console window. With it on, a click
+    in the window starts a text selection and Windows pauses the program at its next write
+    to the screen, until Enter or Esc: on 9 Nov that froze the hedger for up to 55 minutes
+    at a time while the other bots carried on. No effect elsewhere or without a console."""
+    if sys.platform != "win32":
+        return
+    import ctypes
+    with contextlib.suppress(Exception):
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            quick_edit, extended_flags = 0x0040, 0x0080
+            kernel32.SetConsoleMode(handle, (mode.value & ~quick_edit) | extended_flags)
+
+
 def keep_awake() -> None:
     """On a Mac, hold off idle and system sleep for as long as this process lives: asleep, the
     bot cannot manage its quotes but they stay live on the exchange. A closed lid still
@@ -905,6 +922,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seconds", type=float, default=None,
                         help="stop after this long (default: run until Ctrl+C)")
     args = parser.parse_args(argv)
+    no_quickedit()
 
     Path("logs").mkdir(exist_ok=True)
     qte_sdk.logs.configure()

@@ -102,6 +102,7 @@ from dashboard.analytics import (
     smile_iv,
 )
 from dashboard.structures import LegSpec, execution_order, legs
+from strategy.bot import no_quickedit
 from strategy.bs import black76
 from strategy.config import Settings
 from strategy.risk import MULTIPLIER
@@ -1105,6 +1106,7 @@ def main() -> None:
                         help="registered strategy ID for structures sent from the page")
     parser.add_argument("--port", type=int, default=8050)
     args = parser.parse_args()
+    no_quickedit()
     LOGS.mkdir(exist_ok=True)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s",
                         handlers=[logging.StreamHandler(),

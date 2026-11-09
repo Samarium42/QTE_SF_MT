@@ -175,3 +175,54 @@ def test_fixed_mode_still_available(tmp_path, monkeypatch):
     h.cfg = replace(h.cfg, band_mode="fixed")
     asyncio.run(h.on_grid())
     assert h.view["SPY"]["band"] == 150_000
+
+
+# ---------- contracts with no published Greeks (9 Nov) ----------
+
+from strategy.bs import black76
+
+PUT = "SPY261120P00785000"
+
+
+def test_held_contract_without_greeks_is_valued_from_its_mark(tmp_path, monkeypatch):
+    # 9 Nov: the team held deep in-the-money SPY puts with no published Greeks, and the
+    # hedger left the whole of SPY unhedged. Now it backs out the vol from the mark.
+    h = make(tmp_path, monkeypatch, {PUT: -40})
+    fair = black76(False, 650.0, 785.0, 22 / 365, 0.20)
+    h.marks[PUT] = int(round(fair.price, 2) * 1_000_000)
+    asyncio.run(h.on_grid())
+    v = h.view["SPY"]
+    # short 40 puts at delta ~ -1: about +40 x 100 x 650 = +$2.6M of delta
+    assert v["option_delta"] is not None and 2_500_000 < v["option_delta"] < 2_610_000
+    [row] = h.recent
+    assert row["side"] == "SELL"  # long delta: sell stock
+
+
+def test_mark_at_or_below_intrinsic_counts_as_full_delta(tmp_path, monkeypatch):
+    h = make(tmp_path, monkeypatch, {PUT: -10})
+    h.marks[PUT] = 130 * 1_000_000  # below intrinsic of 135: no vol fits
+    delta, gamma = h.model_greeks(PUT)
+    assert delta == -1 and gamma == 0
+
+
+def test_without_a_mark_it_still_refuses(tmp_path, monkeypatch):
+    h = make(tmp_path, monkeypatch, {PUT: -10})
+    asyncio.run(h.on_grid())
+    assert h.view["SPY"]["option_delta"] is None and not h.recent
+
+
+def test_published_greeks_win_over_the_model(tmp_path, monkeypatch):
+    h = make(tmp_path, monkeypatch, {CALL: 40})
+    h.marks[CALL] = 1 * 1_000_000  # a mark the model would read very differently
+    asyncio.run(h.on_grid())
+    assert abs(h.view["SPY"]["option_delta"] - 40 * 100 * 0.5 * 650) < 1
+
+
+def test_hedge_only_reject_holds_two_seconds_not_ten(tmp_path, monkeypatch):
+    from qte_sdk.contract.v1.common_pb2 import ReasonCodes
+    from qte_sdk.contract.v1.order_events_pb2 import Reject
+    h = make(tmp_path, monkeypatch, {CALL: 40})
+    h.pending["ref1"] = ("SPY", time.monotonic())
+    monkeypatch.setattr(hedger_module, "request_ref_of", lambda m: "ref1")
+    h.on_order_event(Reject(reason_code=ReasonCodes.HEDGE_ONLY))
+    assert 1.5 < h.blocked_until["SPY"] - time.monotonic() <= 2.0

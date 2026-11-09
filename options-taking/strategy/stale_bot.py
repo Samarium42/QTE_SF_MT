@@ -61,6 +61,7 @@ from qte_sdk.reconnect import ReconnectingSession
 from qte_sdk.resting import RestingOrders
 from qte_sdk.units import to_decimal
 
+from strategy.bot import no_quickedit
 from strategy.config import StaleSettings
 from strategy.risk import Leg, SoftLimits, adds_risk, measure
 from strategy.stale import find_takes
@@ -444,6 +445,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="log what it would take; send nothing")
     parser.add_argument("--seconds", type=float, default=None, help="stop after this long")
     args = parser.parse_args(argv)
+    no_quickedit()
 
     Path("logs").mkdir(exist_ok=True)
     qte_sdk.logs.configure()

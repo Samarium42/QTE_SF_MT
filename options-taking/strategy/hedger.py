@@ -57,6 +57,8 @@ from qte_sdk.reconnect import ReconnectingSession
 from qte_sdk.resting import RestingOrders
 from qte_sdk.units import to_decimal
 
+from strategy.bot import no_quickedit
+from strategy.bs import black76, implied_vol
 from strategy.config import HedgerSettings
 from strategy.risk import MULTIPLIER, band_hedge_shares, hedge_shares, ww_band
 
@@ -104,6 +106,7 @@ class Hedger:
 
         self.last_delta: dict[str, Decimal] = {}  # last valid published delta per contract
         self.last_gamma: dict[str, Decimal] = {}  # and gamma, per share per $1
+        self.forwards: dict[tuple[str, date], float] = {}  # (underlying, expiry) -> forward
         self.view: dict[str, dict] = {}  # per underlying, for the status file
         self.hedges = 0
         self.shares_filled = 0
@@ -154,6 +157,9 @@ class Hedger:
         if item is not None:
             self.books.update(item)
             self.greeks.update(item)
+            if getattr(item, "forward", 0) and is_option_symbol(getattr(item, "instrument", "")):
+                symbol = parse_option_symbol(item.instrument)
+                self.forwards[(symbol.underlying, symbol.expiry)] = item.forward / 1_000_000
             if isinstance(item, Mark):
                 if item.condition == LIVE:
                     self.marks[item.instrument] = item.value
@@ -179,6 +185,13 @@ class Hedger:
             if reason in BUDGET_REJECTS:
                 log.warning("message budget reject (%s): pausing for a minute", reason_code_name(reason))
                 self.paused_until = time.monotonic() + 61.0
+            elif reason == ReasonCodes.HEDGE_ONLY:
+                # The exchange does not count this order as a qualifying hedge (Rule 6006),
+                # often because of the book-wide test across both underlyings. Retry soon
+                # from fresh positions instead of leaving the underlying for 10 s.
+                self.warn(f"hedge-only-{underlying}", "hedge reject HEDGE_ONLY on %s: the exchange "
+                          "does not count it as a qualifying hedge; retrying in 2 s", underlying)
+                self.blocked_until[underlying] = time.monotonic() + 2.0
             else:
                 log.warning("hedge reject %s on %s: holding that underlying 10 s",
                             reason_code_name(reason), underlying)
@@ -224,11 +237,47 @@ class Hedger:
             # A failed Greek calculation keeps the last Greeks (Rule 6003): so do we.
             delta = self.last_delta.get(instrument)
             if delta is None:
-                self.warn(f"greeks-{underlying}", "no Greeks yet for %s: not hedging %s",
-                          instrument, underlying)
-                return None
+                # No published Greeks at all (on 9 Nov the exchange published none for deep
+                # in-the-money SPY puts held by the team, and the hedger left the whole of
+                # SPY unhedged all session). Value it ourselves: Black-76 off its mark.
+                model = self.model_greeks(instrument)
+                if model is None:
+                    self.warn(f"greeks-{underlying}", "no Greeks and no mark for %s: not hedging %s",
+                              instrument, underlying)
+                    return None
+                delta, gamma = model
+                self.last_gamma[instrument] = gamma
+                self.warn(f"model-{instrument}", "no published Greeks for %s: using Black-76 delta "
+                          "%.3f from its mark", instrument, delta)
             total += qty * MULTIPLIER * delta * to_decimal(spot)
         return total
+
+    def model_greeks(self, instrument: str) -> tuple[Decimal, Decimal] | None:
+        """Delta and gamma (per share, gamma per $1) of a contract the exchange publishes
+        no Greeks for: Black-76 at the volatility that prices it at its official mark,
+        on the published forward for its expiry (the spot mark if none is known). If no
+        volatility fits (a deep in-the-money mark at or below intrinsic), its delta is
+        +1 or -1 for in the money and 0 out of it."""
+        mark = self.marks.get(instrument)
+        if mark is None or self.state is None:
+            return None
+        symbol = parse_option_symbol(instrument)
+        spot = self.marks.get(symbol.underlying)
+        forward = self.forwards.get((symbol.underlying, symbol.expiry))
+        if forward is None:
+            if spot is None:
+                return None
+            forward = spot / 1_000_000
+        call = symbol.right == "C"
+        strike = symbol.strike / 1_000_000
+        days = (symbol.expiry - date.fromisoformat(self.state.session_date)).days
+        years = max(days, 1) / 365
+        vol = implied_vol(call, mark / 1_000_000, forward, strike, years)
+        if vol is None:
+            itm = forward > strike if call else forward < strike
+            return Decimal((1 if call else -1) if itm else 0), Decimal(0)
+        value = black76(call, forward, strike, years, vol)
+        return Decimal(str(value.delta)), Decimal(str(value.gamma))
 
     def option_gamma(self, underlying: str) -> Decimal:
         """Net gamma of the team's options in one underlying, in shares per $1 move. A
@@ -280,6 +329,14 @@ class Hedger:
         self.pending = {r: v for r, v in self.pending.items()
                         if now - v[1] < self.cfg.pending_timeout_seconds}
         self.read_quoter()
+        # A held contract can leave the listed window (deep in or out of the money); we
+        # still need its mark to value it, so subscribe to every option the team holds.
+        held = [i for i, q in self.positions.items()
+                if q and is_option_symbol(i) and i not in self.subscribed]
+        if held and self.connected:
+            self.subscribed.update(held)
+            with contextlib.suppress(Exception):
+                await subscribe(self.session, held)
         for underlying in self.underlyings:
             await self.hedge(underlying, now)
         self.write_status(now)
@@ -483,6 +540,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="log what it would hedge; send nothing")
     parser.add_argument("--seconds", type=float, default=None, help="stop after this long")
     args = parser.parse_args(argv)
+    no_quickedit()
 
     Path("logs").mkdir(exist_ok=True)
     qte_sdk.logs.configure()
