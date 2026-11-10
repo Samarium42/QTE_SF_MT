@@ -31,7 +31,7 @@ import qte_sdk.logs
 from qte_sdk.account import AccountReports, is_account_state
 from qte_sdk.books import LatestBooks
 from qte_sdk.connection import Connected, Disconnected, ResumeComplete
-from qte_sdk.contract.v1.common_pb2 import BUY, LIMIT, SELL, MarketSessionPhase, ReasonCodes
+from qte_sdk.contract.v1.common_pb2 import BUY, LIMIT, SELL, LimitKind, MarketSessionPhase, ReasonCodes
 from qte_sdk.contract.v1.market_data_pb2 import LIVE
 from qte_sdk.contract.v1.order_events_pb2 import Execution, Reject
 from qte_sdk.market_data import Mark, SessionState, as_market_data, subscribe
@@ -107,6 +107,13 @@ class Hedger:
         self.last_delta: dict[str, Decimal] = {}  # last valid published delta per contract
         self.last_gamma: dict[str, Decimal] = {}  # and gamma, per share per $1
         self.forwards: dict[tuple[str, date], float] = {}  # (underlying, expiry) -> forward
+        # The exchange's own net delta per underlying (its Rule 6005 limit row), when it
+        # last arrived, and from it the exchange's delta for our contracts that have no
+        # published Greeks: underlying -> (dollar delta, those contracts, when).
+        self.exchange_net: dict[str, Decimal] = {}
+        self.exchange_unpriced: dict[str, tuple[Decimal, frozenset, float]] = {}
+        # (underlying, expiry) -> {strike: published implied vol, a fraction}
+        self.vols: dict[tuple[str, date], dict[float, float]] = {}
         self.view: dict[str, dict] = {}  # per underlying, for the status file
         self.hedges = 0
         self.shares_filled = 0
@@ -123,6 +130,11 @@ class Hedger:
                 if message.HasField("summary"):
                     self.daily_pnl = to_decimal(message.summary.daily_pnl)
                     self.in_cure = message.summary.in_cure
+                    for row in message.summary.limits:
+                        if row.kind == LimitKind.LIMIT_NET_DELTA_UNDERLYING and row.HasField("scope"):
+                            self.exchange_net[row.scope] = to_decimal(row.used)
+                    for underlying in self.underlyings:
+                        self.read_exchange_delta(underlying)
                 self.account_known = True
             elif isinstance(message, Execution):
                 signed = message.fill_size if message.side == BUY else -message.fill_size
@@ -160,6 +172,10 @@ class Hedger:
             if getattr(item, "forward", 0) and is_option_symbol(getattr(item, "instrument", "")):
                 symbol = parse_option_symbol(item.instrument)
                 self.forwards[(symbol.underlying, symbol.expiry)] = item.forward / 1_000_000
+                if getattr(item, "implied_vol", 0) and item.status == OPTION_GREEKS_VALID:
+                    # published in millionths of a vol point: 18_000_000 is 18%
+                    self.vols.setdefault((symbol.underlying, symbol.expiry), {})[
+                        symbol.strike / 1_000_000] = item.implied_vol / 100_000_000
             if isinstance(item, Mark):
                 if item.condition == LIVE:
                     self.marks[item.instrument] = item.value
@@ -217,13 +233,15 @@ class Hedger:
             self.last_warn[key] = now
             log.warning(text, *args)
 
-    def option_delta(self, underlying: str) -> Decimal | None:
-        """Dollar delta of the team's options in one underlying, from the published Greeks
-        (Rule 6003), or None if any position cannot be measured."""
+    def split_delta(self, underlying: str) -> tuple[Decimal, Decimal, frozenset] | None:
+        """The team's options in one underlying, in dollars of delta: the part with
+        published Greeks (Rule 6003; a failed calculation keeps the last ones), our own
+        Black-76 value of the part without (see model_greeks), and which contracts those
+        are. None if a contract cannot be valued at all."""
         spot = self.marks.get(underlying)
         if spot is None:
             return None
-        total = Decimal(0)
+        published, modelled, unpriced = Decimal(0), Decimal(0), set()
         for instrument, qty in self.positions.items():
             if qty == 0 or not is_option_symbol(instrument):
                 continue
@@ -234,32 +252,71 @@ class Hedger:
                 self.last_delta[instrument] = greek_to_decimal(g.delta)
             if g is not None and g.status == OPTION_GREEKS_VALID and g.HasField("gamma"):
                 self.last_gamma[instrument] = greek_to_decimal(g.gamma)
-            # A failed Greek calculation keeps the last Greeks (Rule 6003): so do we.
             delta = self.last_delta.get(instrument)
-            if delta is None:
-                # No published Greeks at all (on 9 Nov the exchange published none for deep
-                # in-the-money SPY puts held by the team, and the hedger left the whole of
-                # SPY unhedged all session). Value it ourselves: Black-76 off its mark.
-                model = self.model_greeks(instrument)
-                if model is None:
-                    self.warn(f"greeks-{underlying}", "no Greeks and no mark for %s: not hedging %s",
-                              instrument, underlying)
-                    return None
-                delta, gamma = model
-                self.last_gamma[instrument] = gamma
-                self.warn(f"model-{instrument}", "no published Greeks for %s: using Black-76 delta "
-                          "%.3f from its mark", instrument, delta)
-            total += qty * MULTIPLIER * delta * to_decimal(spot)
-        return total
+            if delta is not None:
+                published += qty * MULTIPLIER * delta * to_decimal(spot)
+                continue
+            model = self.model_greeks(instrument)
+            if model is None:
+                self.warn(f"greeks-{underlying}", "no Greeks and no prices to value %s: not hedging %s",
+                          instrument, underlying)
+                return None
+            self.last_gamma[instrument] = model[1]
+            modelled += qty * MULTIPLIER * model[0] * to_decimal(spot)
+            unpriced.add(instrument)
+        return published, modelled, frozenset(unpriced)
+
+    def read_exchange_delta(self, underlying: str) -> None:
+        """When the account summary arrives, work out from the exchange's own net delta for
+        the underlying what delta the exchange gives our contracts that have no published
+        Greeks: its net delta, less our stock and less the part we value from published
+        Greeks. Its net delta may be reported as a magnitude, so of the two signs take
+        the one nearer our own Black-76 value. Only that part is taken from the report:
+        the rest stays live, since the report is a few seconds old after any fill."""
+        used = self.exchange_net.get(underlying)
+        split = self.split_delta(underlying)
+        spot = self.marks.get(underlying)
+        if used is None or split is None or spot is None or not split[2]:
+            self.exchange_unpriced.pop(underlying, None)
+            return
+        published, modelled, unpriced = split
+        stock = self.positions.get(underlying, 0) * to_decimal(spot)
+        candidates = [used - stock - published] + ([-used - stock - published] if used > 0 else [])
+        exchange = min(candidates, key=lambda c: abs(c - modelled))
+        self.exchange_unpriced[underlying] = (exchange, unpriced, time.time())
+        self.warn(f"exchange-{underlying}", "%s: the exchange's net delta $%s puts our contracts with no "
+                  "published Greeks (%s) at $%s of delta; our Black-76 value is $%s",
+                  underlying, round(used), ", ".join(sorted(unpriced)), round(exchange), round(modelled))
+
+    def option_delta(self, underlying: str) -> Decimal | None:
+        """Dollar delta of the team's options in one underlying, or None if any position
+        cannot be measured. Contracts with published Greeks use them; for any without, the
+        exchange's own figure is used when its account summary is under a minute old and
+        covers the same contracts, and our Black-76 value otherwise."""
+        split = self.split_delta(underlying)
+        if split is None:
+            return None
+        published, modelled, unpriced = split
+        if not unpriced:
+            return published
+        exchange = self.exchange_unpriced.get(underlying)
+        if exchange is not None and exchange[1] == unpriced and time.time() - exchange[2] < 60:
+            return published + exchange[0]
+        self.warn(f"model-{underlying}", "no published Greeks for %s: using our Black-76 delta, $%s",
+                  ", ".join(sorted(unpriced)), round(modelled))
+        return published + modelled
 
     def model_greeks(self, instrument: str) -> tuple[Decimal, Decimal] | None:
         """Delta and gamma (per share, gamma per $1) of a contract the exchange publishes
-        no Greeks for: Black-76 at the volatility that prices it at its official mark,
-        on the published forward for its expiry (the spot mark if none is known). If no
-        volatility fits (a deep in-the-money mark at or below intrinsic), its delta is
-        +1 or -1 for in the money and 0 out of it."""
-        mark = self.marks.get(instrument)
-        if mark is None or self.state is None:
+        no Greeks for, by Black-76 on the published forward for its expiry (the spot mark
+        if none is known), at a volatility from, in order:
+          1. its own official mark (the vol that prices it there);
+          2. the published implied vol of the nearest strike in the same expiry, or in any
+             expiry of that underlying (on 10 Nov the exchange published neither Greeks
+             nor a mark for a deep in-the-money SPY put the team held);
+        and if neither is there, delta +1 or -1 in the money and 0 out of it. A mark at
+        or below intrinsic, where no vol fits, also counts as +1 or -1."""
+        if self.state is None:
             return None
         symbol = parse_option_symbol(instrument)
         spot = self.marks.get(symbol.underlying)
@@ -272,10 +329,22 @@ class Hedger:
         strike = symbol.strike / 1_000_000
         days = (symbol.expiry - date.fromisoformat(self.state.session_date)).days
         years = max(days, 1) / 365
-        vol = implied_vol(call, mark / 1_000_000, forward, strike, years)
+        itm_delta = Decimal((1 if call else -1) if (forward > strike if call else forward < strike) else 0)
+
+        vol = None
+        mark = self.marks.get(instrument)
+        if mark is not None:
+            vol = implied_vol(call, mark / 1_000_000, forward, strike, years)
+            if vol is None:
+                return itm_delta, Decimal(0)  # at or below intrinsic
         if vol is None:
-            itm = forward > strike if call else forward < strike
-            return Decimal((1 if call else -1) if itm else 0), Decimal(0)
+            same = self.vols.get((symbol.underlying, symbol.expiry))
+            pool = same or {k: v for (u, _), smile in self.vols.items() if u == symbol.underlying
+                            for k, v in smile.items()}
+            if pool:
+                vol = pool[min(pool, key=lambda k: abs(k - strike))]
+        if vol is None:
+            return itm_delta, Decimal(0)
         value = black76(call, forward, strike, years, vol)
         return Decimal(str(value.delta)), Decimal(str(value.gamma))
 

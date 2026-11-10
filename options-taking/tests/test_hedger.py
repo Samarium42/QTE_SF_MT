@@ -205,10 +205,23 @@ def test_mark_at_or_below_intrinsic_counts_as_full_delta(tmp_path, monkeypatch):
     assert delta == -1 and gamma == 0
 
 
-def test_without_a_mark_it_still_refuses(tmp_path, monkeypatch):
+def test_without_a_mark_it_uses_the_nearest_published_vol(tmp_path, monkeypatch):
+    # 10 Nov: no Greeks and no mark for the put. The nearest strike's published vol
+    # (here 25%, at 700) values it instead.
+    h = make(tmp_path, monkeypatch, {PUT: -10})
+    from qte_sdk.connection import Received
+    greeks = md.OptionGreeks(instrument="SPY261120P00700000", grid_time=3, status=OPTION_GREEKS_VALID,
+                             forward=650 * M, implied_vol=25_000_000, delta=-int(0.9 * 10**12))
+    asyncio.run(h.on_event(Received(type="option_greeks", message=greeks, seq=1)))
+    delta, gamma = h.model_greeks(PUT)
+    expected = black76(False, 650.0, 785.0, 22 / 365, 0.25).delta
+    assert abs(float(delta) - expected) < 1e-9 and -1 < delta < -0.99
+
+
+def test_with_no_prices_at_all_deep_in_the_money_counts_as_full_delta(tmp_path, monkeypatch):
     h = make(tmp_path, monkeypatch, {PUT: -10})
     asyncio.run(h.on_grid())
-    assert h.view["SPY"]["option_delta"] is None and not h.recent
+    assert abs(h.view["SPY"]["option_delta"] - 10 * 100 * 650) < 1  # short 10 puts at -1
 
 
 def test_published_greeks_win_over_the_model(tmp_path, monkeypatch):
@@ -226,3 +239,43 @@ def test_hedge_only_reject_holds_two_seconds_not_ten(tmp_path, monkeypatch):
     monkeypatch.setattr(hedger_module, "request_ref_of", lambda m: "ref1")
     h.on_order_event(Reject(reason_code=ReasonCodes.HEDGE_ONLY))
     assert 1.5 < h.blocked_until["SPY"] - time.monotonic() <= 2.0
+
+
+# ---------- the exchange's own net delta for contracts with no Greeks ----------
+
+from decimal import Decimal
+
+def test_exchange_net_delta_sets_the_unpriced_contracts_delta(tmp_path, monkeypatch):
+    # 40 calls at 0.5 published (+$1.3M), 10 puts with nothing published, short 1000
+    # shares (-$650k). The exchange says net delta is $1.25M, so it values the puts at
+    # 1.25M + 650k - 1.3M = +$600k (short 10 puts at about -0.92).
+    h = make(tmp_path, monkeypatch, {CALL: 40, PUT: -10, "SPY": -1000})
+    h.exchange_net["SPY"] = Decimal(1_250_000)
+    h.read_exchange_delta("SPY")
+    assert abs(h.option_delta("SPY") - (1_300_000 + 600_000)) < 1
+
+
+def test_magnitude_only_report_takes_the_sign_nearer_our_model(tmp_path, monkeypatch):
+    # The same book, but if the exchange's figure were the other sign (-1.25M) the puts
+    # would come out at -$1.9M, far from our model's +$650k: so +1.25M is taken.
+    h = make(tmp_path, monkeypatch, {CALL: 40, PUT: -10, "SPY": -1000})
+    h.exchange_net["SPY"] = Decimal(1_250_000)
+    h.read_exchange_delta("SPY")
+    assert h.exchange_unpriced["SPY"][0] > 0
+
+
+def test_an_old_report_falls_back_to_our_model(tmp_path, monkeypatch):
+    h = make(tmp_path, monkeypatch, {CALL: 40, PUT: -10})
+    h.exchange_net["SPY"] = Decimal(2_000_000)
+    h.read_exchange_delta("SPY")
+    value, contracts, _ = h.exchange_unpriced["SPY"]
+    h.exchange_unpriced["SPY"] = (value, contracts, time.time() - 120)
+    assert abs(h.option_delta("SPY") - (1_300_000 + 10 * 100 * 650)) < 1  # model: delta -1
+
+
+def test_a_fill_elsewhere_after_the_report_still_counts_live(tmp_path, monkeypatch):
+    h = make(tmp_path, monkeypatch, {CALL: 40, PUT: -10, "SPY": -1000})
+    h.exchange_net["SPY"] = Decimal(1_250_000)
+    h.read_exchange_delta("SPY")
+    h.positions[CALL] = 50  # 10 more calls fill before the next report: +$325k
+    assert abs(h.option_delta("SPY") - (1_625_000 + 600_000)) < 1
