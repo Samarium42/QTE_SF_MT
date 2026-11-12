@@ -342,6 +342,14 @@ input[type=number] { width: 84px; }
     <div class="scroll"><table id="staleTakes"></table></div>
   </section>
   <section>
+    <h2>SVI rich/cheap <span class="q" title="A separate strategy (strategy/svi_bot.py, its own strat_id). Every couple of seconds it fits an SVI curve through each expiry's out-of-the-money vols. A contract whose vol is at least min_vol_gap vol points over the curve is sold, under it is bought, at a price that still beats the curve's price after the fee. From logs/svi-status.json.">?</span></h2>
+    <p class="sub">The fitted curves, the strikes furthest off them, and the takes.</p>
+    <div id="sviBox"></div>
+    <div class="scroll"><table id="sviFits"></table></div>
+    <div class="scroll"><table id="sviOff"></table></div>
+    <div class="scroll"><table id="sviTakes"></table></div>
+  </section>
+  <section>
     <h2>Bot log</h2>
     <p class="sub">Warnings, rejects, fills and hedges from <code>logs/bot-*.log</code>.</p>
     <div class="scroll"><ul class="feed" id="botEvents"></ul></div>
@@ -665,6 +673,28 @@ function renderAnalytics(a) {
   table("staleTakes", [["Time"], ["Contract"], ["Trade"], ["Size", 1], ["At", 1], ["Wall mid", 1], ["Edge / share", 1, "After the $0.30 taker fee"]],
     (st ? st.recent : []).map((r) => [hhmm(r.t), esc(r.contract), `<span class="chip ${r.side === "BUY" ? "buy" : "sell"}">${r.side}</span>`, fmt(r.size), fmt(r.price, 2), fmt(r.fair, 3), fmt(r.edge, 3)]),
     "No stale quotes found yet.");
+  // SVI rich/cheap
+  const sv = a.svi;
+  if (!sv) $("sviBox").innerHTML = '<div class="empty">Not run yet. Start it from Strategies, or <code>python -m strategy.svi_bot --strat-id &lt;ID&gt; --dry-run</code>.</div>';
+  else {
+    const up = sv.age <= 30;
+    $("sviBox").innerHTML = `<dl class="kv">
+      <dt>State</dt><dd><span class="dot ${up ? (sv.dry_run ? "warning" : "good") : "critical"}"></span> ${up ? (sv.dry_run ? "running, dry run (sends nothing)" : "running, live") : "not running (last seen " + ago(sv.age) + ")"}${up && !sv.trading ? " · not taking (closed, near the close, or reconciling)" : ""}</dd>
+      <dt>Strategy ID</dt><dd>${esc(sv.strat_id)}</dd>
+      <dt>Takes</dt><dd>${fmt(sv.seen)} found · ${fmt(sv.sent)} sent · ${fmt(sv.filled)} contracts filled</dd>
+      <dt title="Dollars the fills were better than the SVI curve's price, before fees">Edge vs curve</dt><dd>${usd(sv.svi_edge)}</dd>
+      <dt title="Dollars the fills were better than the wall mid (the mark) at the time. Negative is normal when crossing the wall: it comes back only if the mark moves to the curve.">Edge vs mark</dt><dd>${usd(sv.fill_edge)}</dd>
+    </dl>`;
+  }
+  table("sviFits", [["Underlying"], ["Expiry"], ["Strikes", 1, "Out-of-the-money strikes kept in the fit"], ["Error", 1, "Vega-weighted rmse in vol points; over 1.0 is not traded"], ["a", 1], ["b", 1], ["rho", 1, "Skew: negative means put vols over call vols"], ["m", 1], ["sigma", 1]],
+    (sv ? sv.fits : []).map((f) => [esc(f.underlying), esc(f.expiry), fmt(f.used), fmt(f.rmse, 2), fmt(f.a, 6), fmt(f.b, 5), fmt(f.rho, 3), fmt(f.m, 4), fmt(f.sigma, 4)]),
+    "No expiry fitted yet.");
+  table("sviOff", [["Contract"], ["Vol", 1], ["Curve", 1], ["Gap", 1, "Vol points over (+, rich) or under (−, cheap) the curve"], ["Team position", 1]],
+    (sv ? sv.off_curve : []).map((r) => [esc(r.contract), fmt(r.iv, 2), fmt(r.curve_iv, 2), `<span class="${Math.abs(r.gap) >= sv.min_vol_gap ? (r.gap > 0 ? "neg" : "pos") : ""}">${r.gap > 0 ? "+" : ""}${fmt(r.gap, 2)}</span>`, fmt(r.position)]),
+    "Nothing off the curve yet.");
+  table("sviTakes", [["Time"], ["Contract"], ["Trade"], ["Size", 1], ["At", 1], ["Curve price", 1], ["Gap", 1, "Vol points off the curve"], ["Edge / share", 1, "Against the curve, after the $0.30 taker fee"]],
+    (sv ? sv.recent : []).map((r) => [hhmm(r.t), esc(r.contract), `<span class="chip ${r.side === "BUY" ? "buy" : "sell"}">${r.side}</span>`, fmt(r.size), fmt(r.price, 2), fmt(r.fair, 3), fmt(r.gap, 2), fmt(r.edge, 3)]),
+    "No takes yet.");
   if (S) banner(S, A);
 }
 

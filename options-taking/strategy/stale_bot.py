@@ -76,6 +76,13 @@ STOP_BEFORE_CLOSE_MS = 10 * 60 * 1000
 
 
 class Picker:
+    # The SVI strategy (strategy/svi_bot.py) reuses this class with its own of these.
+    log = log
+    status_path = STATUS
+    stop_key = "picker"
+    fair_name = "wall mid"
+    take_wall = False  # the picker only crosses student quotes, never the wall itself
+
     def __init__(self, session: ReconnectingSession, strat_id: str, cfg: StaleSettings, dry_run: bool):
         self.session = session
         self.strat_id = strat_id
@@ -133,15 +140,15 @@ class Picker:
         if isinstance(event, Connected):
             self.connected = True
             self.account_known = False
-            log.info("connected (reconnected=%s)", event.reconnected)
+            self.log.info("connected (reconnected=%s)", event.reconnected)
             await self.query_account()
             return
         if isinstance(event, Disconnected):
             self.connected = False
-            log.warning("disconnected: %s; no takes until the resume", event.error)
+            self.log.warning("disconnected: %s; no takes until the resume", event.error)
             return
         if isinstance(event, ResumeComplete):
-            log.info("resume complete; %d team orders resting", len(self.resting))
+            self.log.info("resume complete; %d team orders resting", len(self.resting))
             return
 
         table = self.session.instrument_table
@@ -186,18 +193,18 @@ class Picker:
                 edge = to_decimal(int(sign * (fair - message.fill_price))) * 100 * message.fill_size
             self.filled += message.fill_size
             self.fill_edge += edge
-            log.info("FILL %s %s %d @ %s (%s), edge vs wall mid $%s, position now %d",
-                     SIDE_NAME.get(message.side), message.instrument, message.fill_size,
-                     to_decimal(message.fill_price), message.fill_kind, edge,
-                     self.positions.get(message.instrument, 0))
+            self.log.info("FILL %s %s %d @ %s (%s), edge vs wall mid $%s, position now %d",
+                          SIDE_NAME.get(message.side), message.instrument, message.fill_size,
+                          to_decimal(message.fill_price), message.fill_kind, edge,
+                          self.positions.get(message.instrument, 0))
         if isinstance(message, Reject) and request_ref_of(message) is not None:
             reason = message.reason_code
             if reason in BUDGET_REJECTS:
-                log.warning("message budget reject (%s): pausing for a minute", reason_code_name(reason))
+                self.log.warning("message budget reject (%s): pausing for a minute", reason_code_name(reason))
                 self.paused_until = time.monotonic() + 61.0
             elif reason not in (ReasonCodes.MIN_REST_VIOLATION, ReasonCodes.NO_ORDER_AT_LEVEL):
                 instrument = getattr(message, "instrument", None)
-                log.warning("reject %s on %s", reason_code_name(reason), instrument)
+                self.log.warning("reject %s on %s", reason_code_name(reason), instrument)
                 if instrument:
                     self.blocked_until[instrument] = time.monotonic() + 30.0
 
@@ -221,6 +228,15 @@ class Picker:
         return Leg(instrument, symbol.underlying, symbol.expiry, qty, to_decimal(mark),
                    greek_to_decimal(g.delta), greek_to_decimal(g.gamma), to_decimal(g.vega))
 
+    def value(self, contract: str) -> tuple[int | None, int] | None:
+        """The price to beat on this contract and the one side allowed to trade it (0 for
+        both), or None to leave it alone. The picker beats the wall mid, on either side."""
+        return None, 0
+
+    def note(self, contract: str) -> dict:
+        """Extra fields for a take's row on the dashboard."""
+        return {}
+
     async def on_book(self, book: Book) -> None:
         contract = book.instrument
         now = time.monotonic()
@@ -234,7 +250,7 @@ class Picker:
             return
         if not book.bid_levels or not book.ask_levels:
             return
-        if not book.student_bid_levels and not book.student_ask_levels:
+        if not self.take_wall and not book.student_bid_levels and not book.student_ask_levels:
             return
         if self.chain is not None and any(
             e.reducing_only for e in self.chain.expiries
@@ -250,16 +266,27 @@ class Picker:
                 side_map = own_bids if order.key.side == BUY else own_asks
                 side_map[order.key.price] = side_map.get(order.key.price, 0) + order.remaining_size
 
+        valued = self.value(contract)
+        if valued is None:
+            return
+        fair, only_side = valued
+        student_bids = [(lv.price, lv.size) for lv in book.student_bid_levels]
+        student_asks = [(lv.price, lv.size) for lv in book.student_ask_levels]
+        if self.take_wall:
+            student_bids.append((book.bid_levels[0].price, book.bid_levels[0].size))
+            student_asks.append((book.ask_levels[0].price, book.ask_levels[0].size))
         takes = find_takes(
             wall_bid=book.bid_levels[0].price,
             wall_ask=book.ask_levels[0].price,
-            student_bids=[(lv.price, lv.size) for lv in book.student_bid_levels],
-            student_asks=[(lv.price, lv.size) for lv in book.student_ask_levels],
+            student_bids=student_bids,
+            student_asks=student_asks,
             own_bids=own_bids,
             own_asks=own_asks,
             fee=int(self.cfg.taker_fee_per_contract * 1_000_000) // 100,
             min_edge=int(self.cfg.min_edge * 1_000_000),
+            fair=fair,
         )
+        takes = [t for t in takes if only_side in (0, t.side)]
         if not takes:
             return
 
@@ -293,16 +320,17 @@ class Picker:
             row = {"t": time.time(), "contract": contract, "side": SIDE_NAME[side],
                    "price": float(to_decimal(take.price)), "size": size,
                    "fair": float(to_decimal(take.fair)), "edge": float(to_decimal(take.edge))}
+            row.update(self.note(contract))
             self.recent.appendleft(row)
             self.last_take[contract] = now
             if self.dry_run:
-                log.info("WOULD TAKE %s %s %d @ %s (wall mid %s, edge $%s/share after fee)",
-                         SIDE_NAME[side], contract, size, to_decimal(take.price),
-                         to_decimal(take.fair), to_decimal(take.edge))
+                self.log.info("WOULD TAKE %s %s %d @ %s (%s %s, edge $%s/share after fee)",
+                              SIDE_NAME[side], contract, size, to_decimal(take.price),
+                              self.fair_name, to_decimal(take.fair), to_decimal(take.edge))
                 continue
-            log.info("TAKE %s %s %d @ %s (wall mid %s, edge $%s/share after fee)",
-                     SIDE_NAME[side], contract, size, to_decimal(take.price),
-                     to_decimal(take.fair), to_decimal(take.edge))
+            self.log.info("TAKE %s %s %d @ %s (%s %s, edge $%s/share after fee)",
+                          SIDE_NAME[side], contract, size, to_decimal(take.price),
+                          self.fair_name, to_decimal(take.fair), to_decimal(take.edge))
             self.count_message()
             self.sent += 1
             try:
@@ -310,7 +338,7 @@ class Picker:
                                side=side, order_type=LIMIT, price=take.price, size=size,
                                request_ref=new_request_ref())
             except Exception as error:
-                log.warning("send failed: %s", error)
+                self.log.warning("send failed: %s", error)
             break  # one take per contract per book update: the position has changed
 
     # ---------- acting ----------
@@ -349,13 +377,8 @@ class Picker:
     def own_count(self) -> int:
         return sum(1 for o in self.resting if o.strat_id == self.strat_id)
 
-    def write_status(self, now: float) -> None:
-        if now - self.last_status_file < 2:
-            return
-        self.last_status_file = now
-        while self.sent_times and now - self.sent_times[0] > 60:
-            self.sent_times.popleft()
-        status = {
+    def status(self, now: float) -> dict:
+        return {
             "t": time.time(), "strat_id": self.strat_id, "dry_run": self.dry_run,
             "trading": self.trading(), "messages_last_minute": len(self.sent_times),
             "budget_per_minute": self.cfg.sustained_per_minute,
@@ -364,18 +387,26 @@ class Picker:
             "fill_edge": float(self.fill_edge), "daily_pnl": float(self.daily_pnl),
             "in_cure": self.in_cure, "recent": list(self.recent),
         }
+
+    def write_status(self, now: float) -> None:
+        if now - self.last_status_file < 2:
+            return
+        self.last_status_file = now
+        while self.sent_times and now - self.sent_times[0] > 60:
+            self.sent_times.popleft()
+        status = self.status(now)
         with contextlib.suppress(OSError):
-            tmp = STATUS.with_suffix(".tmp")
+            tmp = self.status_path.with_suffix(".tmp")
             tmp.write_text(json.dumps(status))
-            tmp.replace(STATUS)
+            tmp.replace(self.status_path)
 
 
-async def run(args: argparse.Namespace) -> int:
-    cfg = StaleSettings()
+async def run(args: argparse.Namespace, cls: type = Picker, cfg=None) -> int:
+    cfg = cfg or StaleSettings()
     pacer = Pacer(Budget(sustained_per_minute=cfg.sustained_per_minute,
                          burst_per_second=cfg.burst_per_second))
     session = ReconnectingSession(pacing=pacer)
-    picker = Picker(session, args.strat_id, cfg, args.dry_run)
+    picker = cls(session, args.strat_id, cfg, args.dry_run)
 
     loop = asyncio.get_running_loop()
     task = asyncio.current_task()
@@ -384,7 +415,8 @@ async def run(args: argparse.Namespace) -> int:
         loop.add_signal_handler(signal.SIGINT, task.cancel)
         loop.add_signal_handler(signal.SIGTERM, task.cancel)
 
-    # Stop from the dashboard: it writes {"stop": {"picker": time}} to control.json, and a
+    # Stop from the dashboard: it writes {"stop": {"picker": time}} to control.json (the
+    # SVI strategy's key is "svi"), and a
     # request newer than this start shuts down as Ctrl+C does, cancelling our orders first.
     started = time.time()
 
@@ -392,8 +424,8 @@ async def run(args: argparse.Namespace) -> int:
         while True:
             await asyncio.sleep(0.5)
             with contextlib.suppress(OSError, ValueError, AttributeError, TypeError):
-                if json.loads(CONTROL.read_text()).get("stop", {}).get("picker", 0) > started:
-                    log.info("stop requested from the dashboard")
+                if json.loads(CONTROL.read_text()).get("stop", {}).get(cls.stop_key, 0) > started:
+                    picker.log.info("stop requested from the dashboard")
                     task.cancel()
                     return
 
@@ -413,14 +445,14 @@ async def run(args: argparse.Namespace) -> int:
                 while True:
                     await picker.on_event(await queue.get())
         except TimeoutError:
-            log.info("time is up")
+            picker.log.info("time is up")
         except asyncio.CancelledError:
-            log.info("interrupted: cancelling this strategy's orders (Ctrl+C again to quit)")
+            picker.log.info("interrupted: cancelling this strategy's orders (Ctrl+C again to quit)")
             task.uncancel()
         picker.stopping = True
         watching.cancel()
-        log.info("takes found %d, sent %d, filled %d contracts, edge vs wall mid $%s",
-                 picker.seen, picker.sent, picker.filled, picker.fill_edge)
+        picker.log.info("takes found %d, sent %d, filled %d contracts, edge vs wall mid $%s",
+                        picker.seen, picker.sent, picker.filled, picker.fill_edge)
         if not args.dry_run:
             for order in list(picker.resting):
                 if order.strat_id == picker.strat_id:
@@ -433,9 +465,9 @@ async def run(args: argparse.Namespace) -> int:
                         await picker.on_event(await queue.get())
         pumping.cancel()
         if not args.dry_run and picker.own_count():
-            log.error("%d orders may still rest: check the console and cancel them", picker.own_count())
+            picker.log.error("%d orders may still rest: check the console and cancel them", picker.own_count())
             return 1
-    log.info("stopped cleanly")
+    picker.log.info("stopped cleanly")
     return 0
 
 

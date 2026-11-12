@@ -35,14 +35,16 @@ def find_takes(
     own_asks: dict[int, int],
     fee: int,
     min_edge: int,
+    fair: int | None = None,
 ) -> list[Take]:
     """The student levels worth crossing on one contract. A level is worth it when its
     price beats the wall mid by at least `min_edge` per share after `fee` per share.
     `own_bids` / `own_asks` map price to our team's resting size there, which the public
-    book counts as student size too."""
+    book counts as student size too. `fair` replaces the wall mid as the value to beat
+    (the SVI strategy passes its curve's price)."""
     if wall_bid <= FLOOR or wall_ask <= wall_bid:
         return []
-    fair2 = wall_bid + wall_ask  # twice the mid, to stay in whole micro-dollars
+    fair2 = wall_bid + wall_ask if fair is None else 2 * fair  # twice the fair value, in whole micro-dollars
     out = []
 
     best_edge, worst, size = None, None, 0

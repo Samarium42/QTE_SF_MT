@@ -208,6 +208,16 @@ Markouts that hold or grow over time mean we aren't being picked off: the edge i
 3. **Hedge with resting orders** just inside the stock wall, to earn the maker rebate instead of paying the taker fee.
 4. **Quote around a smile fair value.** Fit a vega-weighted smile (the dashboard's mispricing scanner already does) and lean quotes towards the cheap side.
 
+## SVI rich/cheap (`strategy/svi_bot.py`, its own strat_id)
+
+Every couple of seconds it fits an SVI curve through each expiry's out-of-the-money vols (`strategy/svi.py`). A strike whose vol is at least `min_vol_gap` (0.5) vol points over the curve is rich, so it sells it; one under the curve is cheap, so it buys it. It crosses a student quote or the wall, but only at a price that beats the curve's price (the mark moved by vega times the gap) by `min_edge` after the fee. It hopes the mark moves back to the curve. If it doesn't, the position is held to the 3-day close with its delta hedged, so caps are small (5 a take, 10 a contract, 20% of the limits).
+
+The curve's five numbers (a, b, rho, m, sigma) are fitted, not chosen. The settings in `SviSettings` decide when a fit is trusted (`min_points`, `max_rmse`, `outlier_vols`) and how big a gap is worth trading (`min_vol_gap`, `min_edge`). Run it in dry run first: the log prints each expiry's fit once a minute with the strikes furthest off, and the dashboard's SVI panel shows the fits, the gaps and the takes it would make.
+
+```
+python -m strategy.svi_bot --strat-id sf_svi_rv_v1 --dry-run
+```
+
 ## Rules: the parts that matter for us
 
 - **Arm:** Options Taking (3 teams). SPY and GOOGL options only; stock **only as a qualifying hedge**. Starting capital $2.5M, reset each term. Max option order 25 contracts; max hedge order $400k.

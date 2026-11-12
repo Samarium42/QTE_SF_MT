@@ -128,6 +128,8 @@ BOTS = {
                "strat_id": "sf_stale_picker_v1", "status": "stale-status.json"},
     "hedger": {"label": "Delta hedger", "module": "strategy.hedger",
                "strat_id": "sf_delta_hedger_v1", "status": "hedger-status.json"},
+    "svi": {"label": "SVI rich/cheap", "module": "strategy.svi_bot",
+            "strat_id": "sf_svi_rv_v1", "status": "svi-status.json"},
 }
 STOP_GRACE = 15.0  # seconds a bot gets to stop itself before its process is killed
 SPOT_MOVES = [-0.05, -0.02, -0.01, 0.0, 0.01, 0.02, 0.05]
@@ -635,6 +637,7 @@ class Hub:
             "bot": self.bot_file(),
             "stale": self.bot_file("stale-status.json"),
             "hedger": self.bot_file("hedger-status.json"),
+            "svi": self.bot_file("svi-status.json"),
         }
 
     def sharpe_view(self) -> dict:

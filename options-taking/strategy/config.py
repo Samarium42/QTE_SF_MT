@@ -153,3 +153,43 @@ class HedgerSettings:
     sustained_per_minute: int = 400
     burst_per_second: int = 50
     account_query_seconds: float = 5.0
+
+
+@dataclass(frozen=True)
+class SviSettings:
+    """The SVI rich/cheap strategy (strategy/svi_bot.py), its own strat_id like the picker.
+
+    The curve's five numbers are not set here: they are fitted to the published vols every
+    refit_seconds (strategy/svi.py). These settings say when to trust a fit and how far off
+    it a contract must be before it is worth trading."""
+
+    limits: ExchangeLimits = ExchangeLimits()
+    # Fraction of each exchange risk limit this strategy keeps to: quoter 0.5 + picker 0.25
+    # + this 0.2 keeps the three under the exchange's limits together.
+    risk_fraction: Decimal = Decimal("0.2")
+    soft_loss: Decimal = Decimal("15_000")  # reduce-only once the day's loss reaches this
+
+    # Fitting. Only out-of-the-money contracts with valid published Greeks go in.
+    refit_seconds: float = 2.0
+    min_points: int = 6  # an expiry with fewer such strikes is not fitted (SVI has 5 numbers)
+    # A fit whose vega-weighted error is more than this many vol points is not traded against.
+    max_rmse: float = 1.0
+    # Strikes this many rmse off the first fit are left out of the second, so the strike we
+    # want to trade does not pull the curve towards itself.
+    outlier_vols: float = 3.0
+    # Leave expiries this close alone: they go reducing-only about 3 days out anyway.
+    min_days: int = 4
+
+    # Trading. A contract is traded only when its own vol (from the official mark) is at
+    # least min_vol_gap off the curve: buy when under it, sell when over it. The price we
+    # cross at must still beat the curve's price by min_edge per share after the fee.
+    min_vol_gap: float = 0.5
+    min_edge: Decimal = Decimal("0.03")
+    taker_fee_per_contract: Decimal = Decimal("0.30")
+    max_order: int = 5  # contracts per take (exchange cap 25)
+    max_position: int = 10  # contracts held long or short in one contract
+    cooldown_seconds: float = 5.0  # least seconds between two takes on one contract
+    # Messages, the same slice as the picker: it sends a few takes and cancels a minute.
+    sustained_per_minute: int = 250
+    burst_per_second: int = 100
+    account_query_seconds: float = 30.0
