@@ -79,6 +79,17 @@ def test_adds_risk_blocks_growth_past_vega_cap_but_allows_reduction():
     assert not adds_risk(before, big, -5, SPOTS, LIMITS, stock)
 
 
+def test_adds_risk_stops_option_delta_past_what_stock_may_hedge():
+    from dataclasses import replace
+    limits = replace(LIMITS, option_delta=Decimal("7_200_000"), book_option_delta=Decimal("8_550_000"))
+    big = leg(220, vega="0.01", gamma="0.0001")  # $7.15M of option delta, little vega or gamma
+    before = measure([big], SPOTS)
+    stock = {"SPY": -before.option_delta["SPY"]}  # fully hedged: net delta 0
+    assert adds_risk(before, big, 5, SPOTS, limits, stock)  # past $7.2M
+    assert not adds_risk(before, big, -5, SPOTS, limits, stock)  # cutting it is fine
+    assert not adds_risk(before, big, 1, SPOTS, limits, stock)  # $7.18M, still under
+
+
 def test_hedge_offsets_delta_and_stays_qualifying():
     # long 10 calls, delta 0.5, spot 650: D = $325k -> sell 500 shares
     d = Decimal(10 * 100) * Decimal("0.5") * 650

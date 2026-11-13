@@ -73,6 +73,10 @@ class SoftLimits:
     v0: Decimal
     gamma: Decimal  # summed |dollar gamma| over underlyings
     today: date
+    # |option dollar delta| the stock hedge can cover, per underlying and summed over both
+    # (Rule 6005 hedge allowances, times config.HEDGEABLE_FRACTION). Unlimited if unset.
+    option_delta: Decimal = Decimal("Infinity")
+    book_option_delta: Decimal = Decimal("Infinity")
 
 
 def adds_risk(
@@ -99,6 +103,16 @@ def adds_risk(
     g_new = g_old + delta_ex.gamma.get(leg.underlying, Decimal(0))
     new_gamma = old_gamma - abs(g_old) + abs(g_new)
     if worse(old_gamma, new_gamma, limits.gamma):
+        return True
+
+    # Option delta past what stock may hedge cannot be hedged, so it counts even when the
+    # net delta after the hedge looks small.
+    old_opt = before.option_delta.get(leg.underlying, Decimal(0))
+    new_opt = old_opt + delta_ex.option_delta.get(leg.underlying, Decimal(0))
+    if worse(old_opt, new_opt, limits.option_delta):
+        return True
+    old_book = sum((abs(d) for d in before.option_delta.values()), Decimal(0))
+    if worse(old_book, old_book - abs(old_opt) + abs(new_opt), limits.book_option_delta):
         return True
 
     # Gross only grows when the trade opens or extends a position.

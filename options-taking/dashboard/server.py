@@ -31,9 +31,11 @@ import logging
 import sys
 import time
 from collections import deque
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from math import sqrt
 from pathlib import Path
+from statistics import mean, stdev
 from zoneinfo import ZoneInfo
 
 from aiohttp import web
@@ -217,6 +219,8 @@ class Hub:
         self.started = time.time()
         self.session_date: str | None = None  # of the latest account state
         self.daily: dict[str, dict] = {}  # session date -> last daily P&L and equity seen
+        self.week_samples: list[dict] = []  # equity over the last 7 days, for the P&L chart
+        self.week_loaded = -1e9
         self.markouts: dict[str, dict[str, float]] = {}  # exec_id -> {horizon: dollars}
         self.load_history()
 
@@ -424,8 +428,13 @@ class Hub:
             self.equity.append(row)
             self.append(f"equity-{date.today().isoformat()}.jsonl", row)
             if self.session_date:
-                self.daily[self.session_date] = {"pnl": row["daily_pnl"], "equity": row["equity"],
-                                                 "t": row["t"]}
+                # Each strategy's P&L so far (from the recorded fills), kept at the first and
+                # last sample of the session, so each day's P&L per strategy is close - open.
+                cum = {r["name"]: r["pnl"] for r in self.pnl_view()["by_strategy"]}
+                day = self.daily.setdefault(self.session_date, {})
+                day.update({"pnl": row["daily_pnl"], "equity": row["equity"], "t": row["t"],
+                            "by_strategy": cum})
+                day.setdefault("by_strategy_open", cum)
                 tmp = LOGS / "daily.tmp"
                 tmp.write_text(json.dumps(self.daily, indent=1))
                 tmp.replace(LOGS / "daily.json")
@@ -519,6 +528,7 @@ class Hub:
         }
         out.update(self.risk_view())
         out["pnl"] = self.pnl_view()
+        out["pnl_history"] = self.pnl_history()
         out["resting"] = sorted(
             ({"strat": o.strat_id, "instrument": o.key.instrument, "side": SIDE.get(o.key.side),
               "price": d(o.key.price), "size": o.remaining_size,
@@ -608,7 +618,67 @@ class Hub:
         since = min((f["t"] for f in self.fills), default=None)
         return {"by_strategy": sorted(by_strat.values(), key=lambda r: r["name"]),
                 "by_underlying": sorted(by_und.values(), key=lambda r: r["name"]),
+                "strategies": self.strategy_rows(by_strat),
                 "since": since}
+
+    def strategy_rows(self, by_strat: dict[str, dict]) -> list[dict]:
+        """Per strategy: today's, this week's and total P&L, and a Sharpe from its daily P&L.
+        A day's P&L is the strategy's P&L at the session's last sample less its first
+        (logs/daily.json, from 13 Nov), so days before that, or when the dashboard was not
+        running, are missing. Sharpe here is sqrt(252) x mean / stdev of daily dollar P&L,
+        with no idle-cash adjustment: that one is for the team's score only."""
+        today = self.session_date or date.today().isoformat()
+        d = date.fromisoformat(today)
+        week0 = (d - timedelta(days=d.weekday())).isoformat()
+        rows = []
+        for name, r in sorted(by_strat.items()):
+            days = []
+            for day in sorted(self.daily):
+                rec = self.daily[day]
+                if "by_strategy_open" not in rec:
+                    continue
+                close = r["pnl"] if day == today else rec.get("by_strategy", {}).get(name)
+                if close is None:
+                    continue
+                days.append((day, close - rec["by_strategy_open"].get(name, 0.0)))
+            values = [v for _, v in days]
+            ratio = 0.0
+            if len(values) > 1 and stdev(values) > 0:
+                ratio = sqrt(252) * mean(values) / stdev(values)
+            rows.append({"name": name, "total": r["pnl"], "fees": r["fees"], "unmarked": r["unmarked"],
+                         "today": values[-1] if days and days[-1][0] == today else 0.0,
+                         "week": sum(v for day, v in days if day >= week0),
+                         "sharpe": ratio, "days": len(values)})
+        return rows
+
+    def pnl_history(self) -> dict:
+        """For the P&L chart's Week and Term views: equity samples over the last 7 days (one
+        per 5 minutes, from the equity-*.jsonl files) and each session's last equity."""
+        now = time.monotonic()
+        if now - self.week_loaded > 300:
+            self.week_loaded = now
+            samples, last = [], 0.0
+            for back in range(7, 0, -1):
+                path = LOGS / f"equity-{(date.today() - timedelta(days=back)).isoformat()}.jsonl"
+                if not path.exists():
+                    continue
+                for line in path.read_text().splitlines():
+                    with contextlib.suppress(json.JSONDecodeError, KeyError):
+                        p = json.loads(line)
+                        if p["t"] - last >= 300:
+                            samples.append({"t": p["t"], "equity": p["equity"]})
+                            last = p["t"]
+            self.week_samples = samples
+        today, last = [], 0.0
+        for p in self.equity:
+            if p.get("equity") is not None and p["t"] - last >= 300:
+                today.append({"t": p["t"], "equity": p["equity"]})
+                last = p["t"]
+        if self.equity and self.equity[-1].get("equity") is not None:
+            today.append({"t": self.equity[-1]["t"], "equity": self.equity[-1]["equity"]})
+        return {"week": self.week_samples + today,
+                "days": [{"date": k, "equity": v["equity"]} for k, v in sorted(self.daily.items())
+                         if v.get("equity") is not None]}
 
     def expiries(self) -> dict:
         out: dict[str, list] = {}

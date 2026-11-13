@@ -72,7 +72,7 @@ from qte_sdk.resting import RestingOrders
 from qte_sdk.units import to_decimal
 
 from strategy.arb import Strike, scan
-from strategy.config import Settings
+from strategy.config import HEDGEABLE_FRACTION, Settings
 from strategy.pricing import is_inside, padding, passive_quotes, reach
 from strategy.risk import MULTIPLIER, Exposure, Leg, SoftLimits, adds_risk, hedge_shares, measure
 
@@ -423,6 +423,8 @@ class Bot:
             v0=lim.v0 * f,
             gamma=lim.gamma * f,
             today=date.fromisoformat(self.state.session_date),
+            option_delta=lim.hedge_allowance_underlying * HEDGEABLE_FRACTION,
+            book_option_delta=lim.hedge_allowance_book * HEDGEABLE_FRACTION,
         )
 
     def targets(self, contract: str, exposure: Exposure, limits: SoftLimits,

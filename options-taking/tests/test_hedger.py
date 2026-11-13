@@ -231,14 +231,54 @@ def test_published_greeks_win_over_the_model(tmp_path, monkeypatch):
     assert abs(h.view["SPY"]["option_delta"] - 40 * 100 * 0.5 * 650) < 1
 
 
-def test_hedge_only_reject_holds_two_seconds_not_ten(tmp_path, monkeypatch):
+def test_hedge_only_reject_holds_additions_everywhere_but_not_reductions(tmp_path, monkeypatch):
     from qte_sdk.contract.v1.common_pb2 import ReasonCodes
     from qte_sdk.contract.v1.order_events_pb2 import Reject
     h = make(tmp_path, monkeypatch, {CALL: 40})
-    h.pending["ref1"] = ("SPY", time.monotonic())
+    h.pending["ref1"] = ("GOOGL", time.monotonic())
     monkeypatch.setattr(hedger_module, "request_ref_of", lambda m: "ref1")
     h.on_order_event(Reject(reason_code=ReasonCodes.HEDGE_ONLY))
-    assert 1.5 < h.blocked_until["SPY"] - time.monotonic() <= 2.0
+    assert 59 < h.additions_held_until - time.monotonic() <= 60
+    asyncio.run(h.on_grid())  # SPY wants to sell stock against long calls: an addition
+    assert not h.recent and h.view["SPY"]["additions_held"]
+    # Too much short stock against the calls: buying some back is a reduction, which goes.
+    h.positions["SPY"] = -2600  # $1.69M short against $1.3M of option delta
+    asyncio.run(h.on_grid())
+    [row] = h.recent
+    assert row["side"] == "BUY"
+
+
+# ---------- hedge allowances (Rule 6005) ----------
+
+def test_stock_stops_short_of_the_hedge_allowance(tmp_path, monkeypatch):
+    # 300 calls: $9.75M of option delta, more than the $8M stock may hedge
+    h = make(tmp_path, monkeypatch, {CALL: 300, "SPY": -12_000})  # $7.8M short already
+    h.books.update(md.Book(instrument="SPY", grid_time=2, condition=md.LIVE,
+                           bid_levels=[md.WallLevel(price=649_900_000, size=5000)],
+                           ask_levels=[md.WallLevel(price=650_100_000, size=5000)]))
+    asyncio.run(h.on_grid())
+    [row] = h.recent
+    # room is $8M - $100k margin = $7.9M, 12,153 shares at $650: 153 more, not the 400k cap
+    assert row["side"] == "SELL" and row["size"] == 153
+    assert h.view["SPY"]["capped"]
+
+
+def test_nothing_sent_at_the_allowance(tmp_path, monkeypatch):
+    h = make(tmp_path, monkeypatch, {CALL: 300, "SPY": -12_153})
+    asyncio.run(h.on_grid())
+    assert not h.recent and h.view["SPY"]["want"] == 0
+
+
+def test_book_allowance_counts_the_other_underlying(tmp_path, monkeypatch):
+    # GOOGL holds $2.6M of short stock, so SPY may use only $9.5M - $2.6M - $0.1M = $6.8M
+    h = make(tmp_path, monkeypatch, {CALL: 300, "SPY": -10_000, "GOOGL": -10_000})
+    h.marks["GOOGL"] = 260 * M
+    h.books.update(md.Book(instrument="SPY", grid_time=2, condition=md.LIVE,
+                           bid_levels=[md.WallLevel(price=649_900_000, size=5000)],
+                           ask_levels=[md.WallLevel(price=650_100_000, size=5000)]))
+    asyncio.run(h.on_grid())
+    [row] = h.recent
+    assert row["size"] == 6_800_000 // 650 - 10_000  # 461
 
 
 # ---------- the exchange's own net delta for contracts with no Greeks ----------

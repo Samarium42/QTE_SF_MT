@@ -89,3 +89,42 @@ def test_scenario_grid_is_zero_at_the_centre_and_long_call_gains_on_rally_and_vo
 def test_markout_sign():
     assert markout("BUY", 5.00, 5.10, 2, 100) == pytest.approx(20.0)
     assert markout("SELL", 5.00, 5.10, 2, 100) == pytest.approx(-20.0)
+
+
+# ---------- P&L by strategy and the chart's history ----------
+
+def make_hub(tmp_path, monkeypatch):
+    import dashboard.server as server
+    monkeypatch.setattr(server, "LOGS", tmp_path)
+    return server.Hub(None, None, server.Settings())
+
+
+def test_strategy_rows_split_today_week_total_and_sharpe(tmp_path, monkeypatch):
+    hub = make_hub(tmp_path, monkeypatch)
+    hub.session_date = "2026-11-13"  # a Friday
+    hub.daily = {  # cumulative P&L per strategy at each session's first and last sample
+        "2026-11-06": {"by_strategy_open": {"q": 0.0}, "by_strategy": {"q": 1000.0}},
+        "2026-11-11": {"by_strategy_open": {"q": 1000.0}, "by_strategy": {"q": 3000.0}},
+        "2026-11-12": {"by_strategy_open": {"q": 3000.0}, "by_strategy": {"q": 2000.0}},
+        "2026-11-13": {"by_strategy_open": {"q": 2000.0, "p": 0.0}, "by_strategy": {"q": 0.0}},
+    }
+    rows = hub.strategy_rows({"q": {"pnl": 2500.0, "fees": 0.0, "unmarked": 0},
+                              "p": {"pnl": -40.0, "fees": 1.0, "unmarked": 0}})
+    p, q = rows
+    assert q["today"] == 500.0 and q["total"] == 2500.0  # live 2500 less today's open 2000
+    assert q["week"] == 2000.0 - 1000.0 + 500.0  # 11, 12 and 13 Nov; 6 Nov was last week
+    # daily 1000, 2000, -1000, 500: mean 625, stdev 1250
+    assert q["days"] == 4 and abs(q["sharpe"] - 252 ** 0.5 * 625 / 1250) < 1e-9
+    assert p["today"] == -40.0 and p["days"] == 1 and p["sharpe"] == 0.0
+
+
+def test_pnl_history_reads_past_days_one_point_per_5_minutes(tmp_path, monkeypatch):
+    import json
+    from datetime import date, timedelta
+    hub = make_hub(tmp_path, monkeypatch)
+    old = tmp_path / f"equity-{(date.today() - timedelta(days=2)).isoformat()}.jsonl"
+    old.write_text("\n".join(json.dumps({"t": 1000.0 + 60 * i, "equity": 2_500_000 + i}) for i in range(30)))
+    hub.daily = {"2026-11-12": {"equity": 2_510_000.0}}
+    h = hub.pnl_history()
+    assert [p["t"] for p in h["week"]] == [1000.0, 1300.0, 1600.0, 1900.0, 2200.0, 2500.0]
+    assert h["days"] == [{"date": "2026-11-12", "equity": 2_510_000.0}]

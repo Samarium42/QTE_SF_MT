@@ -19,9 +19,20 @@ class ExchangeLimits:
     max_option_order: int = 25  # contracts
     max_hedge_order: Decimal = Decimal("400_000")  # dollars of stock
     hedge_tolerance: Decimal = Decimal("100_000")  # |H| <= |D| + $100k (Rule 6006)
+    # Most stock the team may hold as a hedge (Rule 6005): per underlying, and summed.
+    hedge_allowance_underlying: Decimal = Decimal("8_000_000")
+    hedge_allowance_book: Decimal = Decimal("9_500_000")
     loss_halt: Decimal = Decimal("150_000")
     sustained_per_minute: int = 2_400
     burst_per_second: int = 800
+
+
+# Every strategy refuses a trade that takes the book's option delta past this fraction of
+# what stock is allowed to hedge (hedge allowance above): delta past it cannot be hedged at
+# all and goes straight into net delta (13 Nov: SPY options $9.45M against the $8M cap, net
+# $1.47M of the $1.5M limit). Team-wide, not times risk_fraction: each strategy checks the
+# whole book. strategy.risk.adds_risk.
+HEDGEABLE_FRACTION = Decimal("0.9")
 
 
 @dataclass(frozen=True)
@@ -147,12 +158,23 @@ class HedgerSettings:
     pending_timeout_seconds: float = 2.0
     # Stop sending this long before the close (the close cancels everything anyway).
     stop_before_close_seconds: int = 60
-    # Messages: a slice of the team's 2,400 per minute (see StaleSettings for the sum). At 100
-    # the start-up subscriptions (~80 instruments) used most of the minute and the pacer then
-    # froze the hedger for ~50 s with delta unhedged (2 Nov); 400 leaves room for both.
-    sustained_per_minute: int = 400
-    burst_per_second: int = 50
+    # Messages. The SDK pacer counts the whole team's messages, not just the hedger's, so
+    # a 400 slice (320 after headroom) froze the hedger whenever the team sent more than
+    # that: 13 Nov from 16:36 it held every send 8-28 s at a time and no hedge went out.
+    # So the hedger gets the team's whole budget with more headroom than the quoter
+    # (0.9 against 0.8): it waits only when the team passes 2,160 a minute, after the
+    # quoter's own pacer has already backed off at 1,920.
+    sustained_per_minute: int = 2_400
+    burst_per_second: int = 800
+    pacer_headroom: float = 0.9
     account_query_seconds: float = 5.0
+    # Stop this far inside the hedge allowances, so a hedge is not refused RISK_LIMIT_BREACH.
+    allowance_margin: Decimal = Decimal("100_000")
+    # After a HEDGE_ONLY refusal, send no stock that adds to a hedge, in either underlying,
+    # for this long (reductions still go). 12 Nov: every addition from 15:09 to 20:49 was
+    # refused while the team held SPY 785P with no published Greeks, and retrying every 2 s
+    # sent ~26 refused orders a minute.
+    hedge_only_hold_seconds: float = 60.0
 
 
 @dataclass(frozen=True)
@@ -189,7 +211,10 @@ class SviSettings:
     max_order: int = 5  # contracts per take (exchange cap 25)
     max_position: int = 10  # contracts held long or short in one contract
     cooldown_seconds: float = 5.0  # least seconds between two takes on one contract
-    # Messages, the same slice as the picker: it sends a few takes and cancels a minute.
-    sustained_per_minute: int = 250
-    burst_per_second: int = 100
+    # Messages. The SDK pacer counts the whole team's messages, so a small slice here would
+    # freeze it whenever the quoter is busy (the hedger, 13 Nov). The team's budget with the
+    # default 0.8 headroom makes it wait only when the quoter's own pacer does. It sends only
+    # a few takes and cancels a minute itself.
+    sustained_per_minute: int = 2_400
+    burst_per_second: int = 800
     account_query_seconds: float = 30.0

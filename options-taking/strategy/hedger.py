@@ -99,6 +99,9 @@ class Hedger:
         self.last_sent: dict[str, float] = {}  # underlying -> monotonic time of last hedge
         self.paused_until = 0.0
         self.blocked_until: dict[str, float] = {}
+        # After a HEDGE_ONLY refusal: no stock that adds to a hedge, either underlying, until then.
+        self.additions_held_until = 0.0
+        self.unpriced: dict[str, frozenset] = {}  # underlying -> held contracts with no published delta
         self.quoter_hedging = False
         self.last_warn: dict[str, float] = {}
         self.sent_times: deque[float] = deque()
@@ -202,12 +205,22 @@ class Hedger:
                 log.warning("message budget reject (%s): pausing for a minute", reason_code_name(reason))
                 self.paused_until = time.monotonic() + 61.0
             elif reason == ReasonCodes.HEDGE_ONLY:
-                # The exchange does not count this order as a qualifying hedge (Rule 6006),
-                # often because of the book-wide test across both underlyings. Retry soon
-                # from fresh positions instead of leaving the underlying for 10 s.
-                self.warn(f"hedge-only-{underlying}", "hedge reject HEDGE_ONLY on %s: the exchange "
-                          "does not count it as a qualifying hedge; retrying in 2 s", underlying)
-                self.blocked_until[underlying] = time.monotonic() + 2.0
+                # The exchange will not count added stock as a qualifying hedge (Rule 6006).
+                # It refuses additions in both underlyings alike and still takes reductions,
+                # so hold additions everywhere for a while instead of retrying every 2 s.
+                hold = self.cfg.hedge_only_hold_seconds
+                self.additions_held_until = time.monotonic() + hold
+                unpriced = sorted(set().union(*self.unpriced.values()))
+                if unpriced:
+                    log.warning("hedge reject HEDGE_ONLY on %s: no stock additions in any underlying "
+                                "for %d s (reductions still go). We hold contracts with no published "
+                                "Greeks (%s); on 12 Nov every addition was refused until SPY 785P had "
+                                "Greeks again, so close them to hedge normally.",
+                                underlying, hold, ", ".join(unpriced))
+                else:
+                    log.warning("hedge reject HEDGE_ONLY on %s: no stock additions in any underlying "
+                                "for %d s (reductions still go). Check the cure pill and Limits tab.",
+                                underlying, hold)
             else:
                 log.warning("hedge reject %s on %s: holding that underlying 10 s",
                             reason_code_name(reason), underlying)
@@ -297,6 +310,7 @@ class Hedger:
         if split is None:
             return None
         published, modelled, unpriced = split
+        self.unpriced[underlying] = unpriced
         if not unpriced:
             return published
         exchange = self.exchange_unpriced.get(underlying)
@@ -444,6 +458,26 @@ class Hedger:
                 band=band, rehedge_to=self.cfg.rehedge_to,
                 max_order=lim.max_hedge_order, tolerance=self.cfg.tolerance,
             )
+        if abs(shares_held + shares) > abs(shares_held):
+            # Adding to the hedge. Stay inside both hedge allowances (Rule 6005): stock past
+            # them is refused RISK_LIMIT_BREACH, and the option delta beyond them cannot be
+            # hedged at all, so say so.
+            other = sum((abs(q) * to_decimal(self.marks[i]) for i, q in self.positions.items()
+                         if i != underlying and not is_option_symbol(i) and i in self.marks), Decimal(0))
+            room = min(lim.hedge_allowance_underlying, lim.hedge_allowance_book - other) - self.cfg.allowance_margin
+            most = max(0, int(room / spot_d))
+            new = max(-most, min(most, shares_held + shares))
+            if new != shares_held + shares:
+                view["capped"] = True
+                self.warn(f"allowance-{underlying}", "%s: stock hedge capped at %d shares ($%s) by the hedge "
+                          "allowance (Rule 6005). $%s of option delta cannot be hedged with stock; net "
+                          "delta will be $%s. The strategies now only take trades that cut %s option "
+                          "delta until it is back under the cap.", underlying, abs(new), round(room),
+                          round(abs(delta) - abs(new) * spot_d), round(delta + new * spot_d), underlying)
+            shares = new - shares_held if abs(new) > abs(shares_held) else 0
+            if shares and now < self.additions_held_until:
+                view["additions_held"] = True
+                shares = 0
         view["want"] = shares
         if shares == 0 or not self.trading() or now < self.paused_until:
             return
@@ -526,6 +560,8 @@ class Hedger:
             "messages_last_minute": len(self.sent_times),
             "budget_per_minute": self.cfg.sustained_per_minute,
             "budget_paused": now < self.paused_until,
+            "additions_held_for": max(0.0, self.additions_held_until - now),
+            "unpriced": sorted(set().union(*self.unpriced.values())),
             "hedges": self.hedges, "shares_filled": self.shares_filled,
             "underlyings": self.view, "recent": list(self.recent),
             "band_mode": self.cfg.band_mode,
@@ -541,7 +577,7 @@ class Hedger:
 async def run(args: argparse.Namespace) -> int:
     cfg = HedgerSettings()
     pacer = Pacer(Budget(sustained_per_minute=cfg.sustained_per_minute,
-                         burst_per_second=cfg.burst_per_second))
+                         burst_per_second=cfg.burst_per_second), headroom=cfg.pacer_headroom)
     session = ReconnectingSession(pacing=pacer)
     hedger = Hedger(session, args.strat_id, cfg, args.dry_run)
 

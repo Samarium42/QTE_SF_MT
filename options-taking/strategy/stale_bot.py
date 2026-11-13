@@ -62,7 +62,7 @@ from qte_sdk.resting import RestingOrders
 from qte_sdk.units import to_decimal
 
 from strategy.bot import no_quickedit
-from strategy.config import StaleSettings
+from strategy.config import HEDGEABLE_FRACTION, StaleSettings
 from strategy.risk import Leg, SoftLimits, adds_risk, measure
 from strategy.stale import find_takes
 
@@ -296,7 +296,9 @@ class Picker:
         assert self.state is not None
         limits = SoftLimits(gross=lim.gross * f, net_delta=lim.net_delta_per_underlying * f,
                             v0=lim.v0 * f, gamma=lim.gamma * f,
-                            today=date.fromisoformat(self.state.session_date))
+                            today=date.fromisoformat(self.state.session_date),
+                            option_delta=lim.hedge_allowance_underlying * HEDGEABLE_FRACTION,
+                            book_option_delta=lim.hedge_allowance_book * HEDGEABLE_FRACTION)
         leg = self.leg(contract, pos)
         if leg is None:
             return
